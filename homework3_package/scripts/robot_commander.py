@@ -15,12 +15,13 @@
 
 
 from enum import Enum
-import math
+import json
+import os
 import time
 
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Quaternion, PoseStamped, PoseWithCovarianceStamped, PointStamped
+from geometry_msgs.msg import Quaternion, PoseStamped, PoseWithCovarianceStamped
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import Spin, NavigateToPose
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
@@ -35,6 +36,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
+
 
 class TaskResult(Enum):
     UNKNOWN = 0
@@ -55,26 +57,18 @@ class RobotCommander(Node):
         
         self.pose_frame_id = 'map'
         
-        # Flags and helper variables
         self.goal_handle = None
         self.result_future = None
         self.feedback = None
         self.status = None
         self.initial_pose_received = False
         self.is_docked = None
-        self.faces = []
-        self.merge_distance = 0.6
-        self.wait_for_faces_sec = 10.0
 
-        # ROS2 subscribers
         self.create_subscription(DockStatus, 'dock_status', self._dockCallback, qos_profile_sensor_data)
-        self.create_subscription(PointStamped, '/detected_faces', self.face_callback, 10)
         self.localization_pose_sub = self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amclPoseCallback, amcl_pose_qos)
         
-        # ROS2 publishers
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         
-        # ROS2 Action clients
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self.spin_client = ActionClient(self, Spin, 'spin')
         self.undock_action_client = ActionClient(self, Undock, 'undock')
@@ -187,7 +181,6 @@ class RobotCommander(Node):
     def isTaskComplete(self):
         """Check if the task request of any type is complete yet."""
         if not self.result_future:
-            # task was cancelled or completed
             return True
         rclpy.spin_until_future_complete(self, self.result_future, timeout_sec=0.10)
         if self.result_future.result():
@@ -196,7 +189,6 @@ class RobotCommander(Node):
                 self.debug(f'Task with failed with status code: {self.status}')
                 return True
         else:
-            # Timed out, still processing, not complete yet
             return False
 
         self.debug('Task succeeded!')
@@ -267,14 +259,6 @@ class RobotCommander(Node):
     def _dockCallback(self, msg: DockStatus):
         self.is_docked = msg.is_docked
 
-    def face_callback(self, msg: PointStamped):
-        x, y = msg.point.x, msg.point.y
-        for face in self.faces:
-            if math.hypot(x - face.x, y - face.y) < self.merge_distance:
-                return
-        self.info(f"New face detected at ({x:.2f}, {y:.2f}), total: {len(self.faces) + 1}")
-        self.faces.append(msg.point)
-
     def setInitialPose(self, pose):
         msg = PoseWithCovarianceStamped()
         msg.pose.pose = pose
@@ -296,59 +280,77 @@ class RobotCommander(Node):
         self.get_logger().error(msg)
         return
 
+    def load_face_locations(self, faces_file=os.path.expanduser('~/.ros/detected_faces.json')):
+        """Load saved face locations from the JSON file produced by detect_faces."""
+        if not os.path.exists(faces_file):
+            self.warn(f"Faces file not found: {faces_file}")
+            return []
+        try:
+            with open(faces_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            locations = [(float(e['x']), float(e['y']), float(e.get('z', 1.5))) for e in data]
+            self.info(f"Loaded {len(locations)} face location(s) from {faces_file}.")
+            return locations
+        except Exception as e:
+            self.error(f"Failed to load faces file: {e}")
+            return []
+
     def debug(self, msg):
         self.get_logger().debug(msg)
         return
     
 def main(args=None):
-    
+
     rclpy.init(args=args)
     rc = RobotCommander()
 
-    # Wait until Nav2 and Localizer are available
     rc.waitUntilNav2Active()
 
-    # Check if the robot is docked, only continue when a message is recieved
     while rc.is_docked is None:
         rclpy.spin_once(rc, timeout_sec=0.5)
 
-    # If it is docked, undock it first
     if rc.is_docked:
         rc.undock()
-    
-    # Wait a bit for live detections if no saved faces are loaded
-    start_time = time.time()
-    while not rc.faces and (time.time() - start_time < rc.wait_for_faces_sec):
-        rclpy.spin_once(rc, timeout_sec=0.2)
 
-    if not rc.faces:
-        rc.info("No face positions available (no saved file and no live detections). Exiting.")
+    face_locations = rc.load_face_locations()
+
+    if not face_locations:
+        rc.error("No face locations found. Shutting down.")
         rc.destroyNode()
-        rclpy.shutdown()
         return
 
-    for i, face in enumerate(rc.faces, start=1):
+    rc.info(f"Starting navigation tour of {len(face_locations)} face location(s).")
+
+    for i, (fx, fy, fz) in enumerate(face_locations):
+        rc.info(f"Navigating to face {i + 1}/{len(face_locations)} at ({fx:.2f}, {fy:.2f})...")
+
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = rc.get_clock().now().to_msg()
-        goal_pose.pose.position.x = face.x
-        goal_pose.pose.position.y = face.y
+        goal_pose.pose.position.x = fx
+        goal_pose.pose.position.y = fy
         goal_pose.pose.orientation = rc.YawToQuaternion(0.0)
 
-        rc.info(f"Going to face {i}/{len(rc.faces)} at ({face.x:.2f}, {face.y:.2f})")
         if not rc.goToPose(goal_pose):
-            rc.warn(f"Goal for face {i} rejected.")
+            rc.warn(f"Goal {i + 1} was rejected, skipping.")
             continue
 
         while not rc.isTaskComplete():
             rc.info("Waiting for the task to complete...")
-            time.sleep(0.5)
+            time.sleep(1)
 
-        if rc.getResult() != TaskResult.SUCCEEDED:
-            rc.warn(f"Navigation to face {i} did not succeed.")
+        result = rc.getResult()
+        if result == TaskResult.SUCCEEDED:
+            rc.info(f"Reached face {i + 1}/{len(face_locations)}. Spinning to look around...")
+            rc.spin(3.14)   # 180° spin to scan the area
+            while not rc.isTaskComplete():
+                time.sleep(0.5)
+        elif result == TaskResult.FAILED:
+            rc.warn(f"Failed to reach face {i + 1}, continuing to next.")
+        elif result == TaskResult.CANCELED:
+            rc.warn(f"Navigation to face {i + 1} was canceled.")
 
+    rc.info("Visited all face locations. Mission complete.")
     rc.destroyNode()
-
-    # And a simple example
 if __name__=="__main__":
     main()
