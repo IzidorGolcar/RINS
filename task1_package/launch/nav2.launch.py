@@ -30,11 +30,11 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import PushRosNamespace, SetRemap
 
 
-pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+pkg_task1_package = get_package_share_directory('task1_package')
 
 ARGUMENTS = [
     DeclareLaunchArgument('use_sim_time', default_value='false',choices=['true', 'false'], description='Use sim time'),
-    DeclareLaunchArgument('params_file',  default_value=PathJoinSubstitution([pkg_dis_tutorial3,'config','nav2.yaml']), description='Nav2 parameters'),
+    DeclareLaunchArgument('params_file',  default_value=PathJoinSubstitution([pkg_task1_package,'config','nav2.yaml']), description='Nav2 parameters'),
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace')
 ]
 
@@ -75,3 +75,4 @@ def generate_launch_description():
     ld = LaunchDescription(ARGUMENTS)
     ld.add_action(OpaqueFunction(function=launch_setup))
     return ld
+

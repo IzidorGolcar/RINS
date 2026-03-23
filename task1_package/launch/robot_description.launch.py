@@ -33,8 +33,8 @@ ARGUMENTS = [
 ]
 
 def generate_launch_description():
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
-    xacro_file = PathJoinSubstitution([pkg_dis_tutorial3,'urdf',LaunchConfiguration('model'),'turtlebot4.urdf.xacro'])
+    pkg_task1_package = get_package_share_directory('task1_package')
+    xacro_file = PathJoinSubstitution([pkg_task1_package,'urdf',LaunchConfiguration('model'),'turtlebot4.urdf.xacro'])
     namespace = LaunchConfiguration('namespace')
 
     robot_state_publisher = Node(
@@ -71,3 +71,4 @@ def generate_launch_description():
     ld.add_action(robot_state_publisher)
     ld.add_action(joint_state_publisher)
     return ld
+

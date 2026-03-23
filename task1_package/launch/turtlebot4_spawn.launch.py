@@ -43,7 +43,7 @@ for pose_element in ['x', 'y', 'z', 'yaw']:
 
 def generate_launch_description():
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_task1_package = get_package_share_directory('task1_package')
     pkg_turtlebot4_gz_bringup = get_package_share_directory('turtlebot4_gz_bringup')
     pkg_turtlebot4_description = get_package_share_directory('turtlebot4_description')
     pkg_turtlebot4_viz = get_package_share_directory('turtlebot4_viz')
@@ -57,7 +57,7 @@ def generate_launch_description():
     turtlebot4_node_launch = PathJoinSubstitution([pkg_turtlebot4_gz_bringup, 'launch', 'turtlebot4_nodes.launch.py'])
     create3_nodes_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'create3_nodes.launch.py'])
     create3_gz_nodes_launch = PathJoinSubstitution([pkg_irobot_create_gz_bringup, 'launch', 'create3_gz_nodes.launch.py'])
-    robot_description_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'robot_description.launch.py'])
+    robot_description_launch = PathJoinSubstitution([pkg_task1_package, 'launch', 'robot_description.launch.py'])
     dock_description_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'dock_description.launch.py'])
 
     # Parameters
@@ -178,7 +178,7 @@ def generate_launch_description():
         executable="scan_to_scan_filter_chain",
         parameters=[
             PathJoinSubstitution([
-                pkg_dis_tutorial3,
+                pkg_task1_package,
                 "config",
                 "laser_filter_chain.yaml",
             ])
@@ -205,3 +205,4 @@ def generate_launch_description():
     ld.add_action(laser_filter)
     ld.add_action(rviz)
     return ld
+

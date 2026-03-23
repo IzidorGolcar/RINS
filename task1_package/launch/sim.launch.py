@@ -36,7 +36,7 @@ ARGUMENTS = [
 
 def generate_launch_description():
     # Directories
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_task1_package = get_package_share_directory('task1_package')
     pkg_turtlebot4_gz_bringup = get_package_share_directory('turtlebot4_gz_bringup')
     pkg_turtlebot4_gz_gui_plugins = get_package_share_directory('turtlebot4_gz_gui_plugins')
     pkg_turtlebot4_description = get_package_share_directory('turtlebot4_description')
@@ -49,7 +49,7 @@ def generate_launch_description():
     gz_resource_path = SetEnvironmentVariable(
         name='GZ_SIM_RESOURCE_PATH',
         value=':'.join([
-            os.path.join(pkg_dis_tutorial3, 'worlds'), ':' +
+            os.path.join(pkg_task1_package, 'worlds'), ':' +
             os.path.join(pkg_turtlebot4_gz_bringup, 'worlds'),
             os.path.join(pkg_irobot_create_gz_bringup, 'worlds'),
             str(Path(pkg_turtlebot4_description).parent.resolve()),
@@ -104,3 +104,4 @@ def generate_launch_description():
     ld.add_action(gazebo)
     ld.add_action(clock_bridge)
     return ld
+

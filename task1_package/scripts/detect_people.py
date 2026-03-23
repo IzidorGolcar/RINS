@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-import json
-import os
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy
@@ -31,9 +28,17 @@ class detect_faces(Node):
             namespace='',
             parameters=[
                 ('device', 'cpu'),
+                ('detector_backend', 'haar'),
+                ('yolo_model_path', 'yolo26n.pt'),
+                ('yolo_confidence', 0.55),
+                ('haar_scale_factor', 1.1),
+                ('haar_min_neighbors', 6),
+                ('haar_min_face_size', 20),
+                ('min_depth_m', 0.25),
+                ('max_depth_m', 4.0),
                 ('target_frame', 'map'),
-                ('faces_file', os.path.expanduser('~/.ros/detected_faces.json')),
                 ('merge_distance', 0.6),
+                ('face_vote_threshold', 6),
         ])
 
         self.grid_resolution = 10.0
@@ -43,13 +48,20 @@ class detect_faces(Node):
 
 
         self.device = self.get_parameter('device').get_parameter_value().string_value
+        self.detector_backend = self.get_parameter('detector_backend').get_parameter_value().string_value
+        self.yolo_model_path = self.get_parameter('yolo_model_path').get_parameter_value().string_value
+        self.yolo_confidence = self.get_parameter('yolo_confidence').get_parameter_value().double_value
+        self.haar_scale_factor = self.get_parameter('haar_scale_factor').get_parameter_value().double_value
+        self.haar_min_neighbors = self.get_parameter('haar_min_neighbors').get_parameter_value().integer_value
+        self.haar_min_face_size = self.get_parameter('haar_min_face_size').get_parameter_value().integer_value
+        self.min_depth_m = self.get_parameter('min_depth_m').get_parameter_value().double_value
+        self.max_depth_m = self.get_parameter('max_depth_m').get_parameter_value().double_value
         self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
-        self.faces_file = os.path.expanduser(self.get_parameter('faces_file').get_parameter_value().string_value)
         self.merge_distance = self.get_parameter('merge_distance').get_parameter_value().double_value
+        self.face_vote_threshold = self.get_parameter('face_vote_threshold').get_parameter_value().integer_value
         self.bridge = CvBridge()
         self.faces = []
-        self.saved_faces = []
-        self._load_saved_faces()
+        self.detected_faces = []
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -63,11 +75,9 @@ class detect_faces(Node):
         self.marker_pub = self.create_publisher(Marker, "/people_marker", marker_qos)
         self.face_pub = self.create_publisher(PointStamped, '/detected_faces', 10)
 
-        self.model = YOLO("yolo26n.pt") 
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.model = YOLO(self.yolo_model_path)
         self.create_timer(2.0, self.publish_face_locations)
-
-        if self.saved_faces:
-            self.create_timer(2.0, self._republish_saved_faces)
 
         self.get_logger().info("Node has been initialized!")
 
@@ -75,14 +85,41 @@ class detect_faces(Node):
         current_faces = []
         try:
             cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-            res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
 
-            for x in res:
-                bbox = x.boxes.xyxy
-                if bbox.nelement() == 0: continue
-                bbox = bbox[0]
-                cx, cy = int((bbox[0]+bbox[2])/2), int((bbox[1]+bbox[3])/2)
-                current_faces.append((cx, cy))
+            if self.detector_backend == 'haar' and not self.face_cascade.empty():
+                gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+                detections = self.face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=float(self.haar_scale_factor),
+                    minNeighbors=int(self.haar_min_neighbors),
+                    minSize=(int(self.haar_min_face_size), int(self.haar_min_face_size)),
+                )
+                for (x, y, w, h) in detections:
+                    if w <= 0 or h <= 0:
+                        continue
+                    aspect_ratio = float(w) / float(h)
+                    if aspect_ratio < 0.65 or aspect_ratio > 1.45:
+                        continue
+                    current_faces.append((int(x + w / 2), int(y + h / 2)))
+            else:
+                res = self.model.predict(
+                    cv_image,
+                    imgsz=(256, 320),
+                    show=False,
+                    verbose=False,
+                    classes=[0],
+                    conf=float(self.yolo_confidence),
+                    device=self.device,
+                )
+
+                for x in res:
+                    boxes = x.boxes
+                    if boxes is None or len(boxes) == 0:
+                        continue
+                    for bbox in boxes.xyxy:
+                        cx = int((bbox[0] + bbox[2]) / 2)
+                        cy = int((bbox[1] + bbox[3]) / 2)
+                        current_faces.append((cx, cy))
             
             self.faces = current_faces
             cv2.imshow("image", cv_image)
@@ -90,39 +127,8 @@ class detect_faces(Node):
         except CvBridgeError as e:
             self.get_logger().error(f"CvBridge Error: {e}")
 
-    def _load_saved_faces(self):
-        if not os.path.exists(self.faces_file):
-            return
-        try:
-            with open(self.faces_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for entry in data:
-                self.saved_faces.append((float(entry['x']), float(entry['y']), float(entry.get('z', 0.0))))
-            self.get_logger().info(f"Loaded {len(self.saved_faces)} saved face(s) from {self.faces_file}.")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to load faces file: {e}")
-
-    def _save_faces(self):
-        folder = os.path.dirname(self.faces_file)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        payload = [{'x': x, 'y': y, 'z': z} for x, y, z in self.saved_faces]
-        with open(self.faces_file, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2)
-
-    def _republish_saved_faces(self):
-        for fx, fy, fz in self.saved_faces:
-            msg = PointStamped()
-            msg.header.frame_id = self.target_frame
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.point.x = fx
-            msg.point.y = fy
-            msg.point.z = fz
-            self.face_pub.publish(msg)
-        self.get_logger().info(f"Republished {len(self.saved_faces)} saved face(s) on startup.")
-
     def _is_new_face(self, x, y):
-        for fx, fy, _ in self.saved_faces:
+        for fx, fy, _ in self.detected_faces:
             if math.hypot(x - fx, y - fy) < self.merge_distance:
                 return False
         return True
@@ -136,7 +142,7 @@ class detect_faces(Node):
 
     def publish_face_locations(self):
         local_max = maximum_filter(self.face_position_votes, size=3)
-        peaks = (self.face_position_votes == local_max) & (self.face_position_votes >= 5)
+        peaks = (self.face_position_votes == local_max) & (self.face_position_votes >= self.face_vote_threshold)
         
         labeled, num_features = label(peaks)
     
@@ -155,9 +161,8 @@ class detect_faces(Node):
             self.face_pub.publish(msg)
 
             if self._is_new_face(real_x, real_y):
-                self.saved_faces.append((real_x, real_y, 1.5))
-                self._save_faces()
-                self.get_logger().info(f"Saved face #{len(self.saved_faces)} at ({real_x:.2f}, {real_y:.2f})")
+                self.detected_faces.append((real_x, real_y, 1.5))
+                self.get_logger().info(f"Detected face #{len(self.detected_faces)} at ({real_x:.2f}, {real_y:.2f})")
 
         if num_features > 0:
             self.get_logger().info(f'Published {num_features} precision-localized faces.')
@@ -177,7 +182,10 @@ class detect_faces(Node):
         for u, v in faces_to_process:
             if not (0 <= u < data.width and 0 <= v < data.height): continue
             d = cloud_array[v, u, :]
-            if np.isnan(d[0]): continue
+            if np.isnan(d[0]):
+                continue
+            if d[2] < self.min_depth_m or d[2] > self.max_depth_m:
+                continue
 
             raw_pt = PointStamped()
             raw_pt.header = data.header

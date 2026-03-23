@@ -30,7 +30,7 @@ from launch_ros.actions import PushRosNamespace, SetRemap
 
 from nav2_common.launch import RewrittenYaml
 
-pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+pkg_task1_package = get_package_share_directory('task1_package')
 pkg_turtlebot4_navigation = get_package_share_directory('turtlebot4_navigation')
 pkg_slam_toolbox = get_package_share_directory('slam_toolbox')
 
@@ -40,7 +40,7 @@ ARGUMENTS = [
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
     DeclareLaunchArgument('autostart', default_value='true',choices=['true', 'false'],description='Automatically startup the slamtoolbox. Ignored when use_lifecycle_manager is true.'),  # noqa: E501
     DeclareLaunchArgument('use_lifecycle_manager', default_value='false',choices=['true', 'false'], description='Enable bond connection during node activation'),
-    DeclareLaunchArgument('params',default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'config', 'slam.yaml']), description='Path to the SLAM Toolbox configuration file')
+    DeclareLaunchArgument('params',default_value=PathJoinSubstitution([pkg_task1_package, 'config', 'slam.yaml']), description='Path to the SLAM Toolbox configuration file')
 ]
 
 
@@ -105,3 +105,4 @@ def generate_launch_description():
     ld = LaunchDescription(ARGUMENTS)
     ld.add_action(OpaqueFunction(function=launch_setup))
     return ld
+

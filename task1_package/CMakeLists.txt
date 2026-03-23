@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(homework3_package)
+project(task1_package)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 14)
@@ -28,7 +28,10 @@ install(DIRECTORY
 
 install(PROGRAMS
   scripts/detect_people.py
+  scripts/extract_color_from_pointcloud.py
   scripts/robot_commander.py
+  scripts/speech_player.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
+

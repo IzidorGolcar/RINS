@@ -31,18 +31,18 @@ ARGUMENTS = [
 ]
 
 def generate_launch_description():
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
+    pkg_task1_package = get_package_share_directory('task1_package')
     pkg_nav2_bringup = get_package_share_directory('nav2_bringup')
 
     localization_params_arg = DeclareLaunchArgument(
         'params',
-        default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'config', 'localization.yaml']),
+        default_value=PathJoinSubstitution([pkg_task1_package, 'config', 'localization.yaml']),
         description='Localization parameters'
     )
 
     map_arg = DeclareLaunchArgument(
         'map',
-        default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'maps', 'map.yaml']),
+        default_value=PathJoinSubstitution([pkg_task1_package, 'maps', 'task1.yaml']),
         description='Full path to map yaml file to load'
     )
 
@@ -71,3 +71,4 @@ def generate_launch_description():
     ld.add_action(map_arg)
     ld.add_action(localization)
     return ld
+
