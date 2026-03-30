@@ -35,6 +35,7 @@ class FaceDetector(Node):
         self.device = self.get_parameter('device').get_parameter_value().string_value
 
         self.bridge = CvBridge()
+
         self.candidates:     list[dict]       = []
         self.confirmed_faces: list[np.ndarray] = []
 
@@ -60,7 +61,7 @@ class FaceDetector(Node):
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, pc_sub],
             queue_size=5,
-            slop=0.05)          # 50 ms tolerance – OAK-D streams are well synced
+            slop=0.05)
         self.ts.registerCallback(self.synced_callback)
 
         # Publisher
@@ -83,7 +84,6 @@ class FaceDetector(Node):
             self.get_logger().error(str(e))
             return
 
-        #yolo
         res = self.model.predict(
             cv_image,
             imgsz=(256, 320),
@@ -114,7 +114,6 @@ class FaceDetector(Node):
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
 
-                # Secondary filter, Haar
                 gray_roi = gray[y1:y2, x1:x2]
                 if not self._haar_has_face(gray_roi):
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 180), 1)
@@ -147,8 +146,6 @@ class FaceDetector(Node):
                 try:
                     pt_cam = PointStamped()
                     pt_cam.header.frame_id = pc_msg.header.frame_id
-                    # Time(0) = latest available transform (avoids
-                    # extrapolation warnings from timestamp drift)
                     pt_cam.header.stamp = Time(seconds=0).to_msg()
                     pt_cam.point.x = float(d[0])
                     pt_cam.point.y = float(d[1])
@@ -189,7 +186,7 @@ class FaceDetector(Node):
             return False
         h, w = gray_roi.shape[:2]
         if h < 16 or w < 16:
-            return True     # too small for Haar
+            return True
         kwargs = dict(scaleFactor=1.1, minNeighbors=1, minSize=(12, 12))
         if len(self.face_cascade.detectMultiScale(gray_roi, **kwargs)) > 0:
             return True
@@ -230,11 +227,11 @@ class FaceDetector(Node):
         for i, pos in enumerate(self.confirmed_faces):
             sphere = Marker()
             sphere.header.frame_id = 'map'
-            sphere.header.stamp = now
-            sphere.ns = 'faces'
-            sphere.id = i
-            sphere.type = Marker.SPHERE
-            sphere.action = Marker.ADD
+            sphere.header.stamp    = now
+            sphere.ns              = 'faces'
+            sphere.id              = i
+            sphere.type            = Marker.SPHERE
+            sphere.action          = Marker.ADD
             sphere.pose.position.x = float(pos[0])
             sphere.pose.position.y = float(pos[1])
             sphere.pose.position.z = float(pos[2])
@@ -248,19 +245,19 @@ class FaceDetector(Node):
 
             label = Marker()
             label.header.frame_id = 'map'
-            label.header.stamp = now
-            label.ns = 'face_labels'
-            label.id = i
-            label.type = Marker.TEXT_VIEW_FACING
-            label.action = Marker.ADD
+            label.header.stamp    = now
+            label.ns              = 'face_labels'
+            label.id              = i
+            label.type            = Marker.TEXT_VIEW_FACING
+            label.action          = Marker.ADD
             label.pose.position.x = float(pos[0])
             label.pose.position.y = float(pos[1])
             label.pose.position.z = float(pos[2]) + 0.45
             label.pose.orientation.w = 1.0
-            label.scale.z = 0.22
-            label.color.r = label.color.g = label.color.b = 1.0
-            label.color.a = 1.0
-            label.text = f'Face {i + 1}'
+            label.scale.z  = 0.22
+            label.color.r  = label.color.g = label.color.b = 1.0
+            label.color.a  = 1.0
+            label.text     = f'Face {i + 1}'
             ma.markers.append(label)
 
         self.marker_pub.publish(ma)
