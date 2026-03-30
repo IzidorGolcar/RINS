@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""
-Improved face detection node for dis_tutorial3.
-
-Key design decisions
---------------------
-* message_filters.ApproximateTimeSynchronizer pairs each RGB frame with the
-  depth pointcloud that has the closest timestamp.  This eliminates the
-  previous race condition where face pixel coordinates detected in frame N
-  were looked up in the depth map of frame N+1 (which might show a different
-  scene if the robot was moving).
-
-* For each detected face centre (cx, cy), depth is sampled from a small
-  neighbourhood of pixels and the median is taken.  This handles sub-pixel
-  misalignment between the colour and depth images.
-
-* Haar cascade secondary filter verifies YOLO "person" hits are actually
-  faces – two cascades with different training sets are tried in sequence.
-
-* Confirmed faces are deduplicated in map frame: a new detection within
-  FACE_MIN_SEPARATION metres of an existing confirmed face is treated as
-  the same face and silently ignored.
-
-* Temporal confirmation: CONFIRM_HITS detections must cluster in map space
-  before a face is considered confirmed, avoiding single-frame false positives.
-"""
 
 import message_filters
 
@@ -45,11 +20,6 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 class FaceDetector(Node):
-
-    # ------------------------------------------------------------------ #
-    # Tuning constants                                                     #
-    # ------------------------------------------------------------------ #
-
     CONFIDENCE_THRESH   = 0.5   # minimum YOLO confidence
     MIN_DIST            = 0.5   # metres – discard closer detections
     MAX_DIST            = 3.5   # metres – discard farther detections
@@ -58,8 +28,6 @@ class FaceDetector(Node):
     CANDIDATE_RADIUS    = 0.4   # metres – cluster radius for candidates
     DEPTH_SAMPLE_RADIUS = 4     # pixels – neighbourhood radius for depth
 
-    # ------------------------------------------------------------------ #
-
     def __init__(self):
         super().__init__('face_detector')
 
@@ -67,9 +35,6 @@ class FaceDetector(Node):
         self.device = self.get_parameter('device').get_parameter_value().string_value
 
         self.bridge = CvBridge()
-
-        # No cross-callback shared state needed any more – synchronizer
-        # delivers both messages together in a single callback.
         self.candidates:     list[dict]       = []
         self.confirmed_faces: list[np.ndarray] = []
 
@@ -83,10 +48,6 @@ class FaceDetector(Node):
         self.face_cascade_alt2 = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
 
-        # Synchronized subscriptions ------------------------------------ #
-        # ApproximateTimeSynchronizer pairs messages by timestamp (within
-        # slop seconds), so YOLO detections and depth lookup always refer
-        # to the same physical frame.
         rgb_sub = message_filters.Subscriber(
             self, Image,
             '/oakd/rgb/preview/image_raw',
@@ -114,19 +75,15 @@ class FaceDetector(Node):
             f'depth [{self.MIN_DIST}–{self.MAX_DIST}] m, '
             f'confirm after {self.CONFIRM_HITS} hits.')
 
-    # ------------------------------------------------------------------ #
-    # Synchronized callback – YOLO + depth on the same frame pair         #
-    # ------------------------------------------------------------------ #
 
     def synced_callback(self, rgb_msg: Image, pc_msg: PointCloud2) -> None:
-        # --- decode image -----------------------------------------------
         try:
             cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
         except CvBridgeError as e:
             self.get_logger().error(str(e))
             return
 
-        # --- YOLO inference ---------------------------------------------
+        #yolo
         res = self.model.predict(
             cv_image,
             imgsz=(256, 320),
@@ -137,12 +94,10 @@ class FaceDetector(Node):
             device=self.device,
         )
 
-        # --- parse pointcloud once for this frame -----------------------
         h, w = pc_msg.height, pc_msg.width
         pts = pc2.read_points_numpy(pc_msg, field_names=('x', 'y', 'z'))
         pts = pts.reshape((h, w, 3))
 
-        # --- pre-compute grayscale for Haar (one conversion per frame) --
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
         vis  = cv_image.copy()
 
@@ -159,7 +114,7 @@ class FaceDetector(Node):
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
 
-                # Secondary filter – Haar cascade must agree
+                # Secondary filter, Haar
                 gray_roi = gray[y1:y2, x1:x2]
                 if not self._haar_has_face(gray_roi):
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 180), 1)
@@ -170,7 +125,6 @@ class FaceDetector(Node):
                 cv2.putText(vis, f'{conf:.2f}', (x1, max(y1 - 6, 0)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
 
-                # --- depth: sample neighbourhood, take median ----------
                 r = self.DEPTH_SAMPLE_RADIUS
                 patch = pts[max(0, cy - r):cy + r + 1,
                             max(0, cx - r):cx + r + 1, :]
@@ -184,14 +138,12 @@ class FaceDetector(Node):
                     continue
                 d = np.median(valid, axis=0)
 
-                # --- distance filter ------------------------------------
                 dist = float(np.linalg.norm(d))
                 if not (self.MIN_DIST <= dist <= self.MAX_DIST):
                     self.get_logger().debug(
                         f'Skipping: dist={dist:.2f} m outside range')
                     continue
 
-                # --- transform to map frame ----------------------------
                 try:
                     pt_cam = PointStamped()
                     pt_cam.header.frame_id = pc_msg.header.frame_id
@@ -215,7 +167,6 @@ class FaceDetector(Node):
                     self.get_logger().warn(f'TF transform failed: {exc}')
                     continue
 
-                # --- deduplication against confirmed faces -------------
                 if any(
                     np.linalg.norm(pos[:2] - f[:2]) < self.FACE_MIN_SEPARATION
                     for f in self.confirmed_faces
@@ -232,25 +183,17 @@ class FaceDetector(Node):
         if cv2.waitKey(1) == 27:
             rclpy.shutdown()
 
-    # ------------------------------------------------------------------ #
-    # Haar helper                                                          #
-    # ------------------------------------------------------------------ #
-
     def _haar_has_face(self, gray_roi: np.ndarray) -> bool:
         """Return True if either Haar cascade finds a face in *gray_roi*."""
         if gray_roi is None or gray_roi.size == 0:
             return False
         h, w = gray_roi.shape[:2]
         if h < 16 or w < 16:
-            return True     # too small for Haar – trust YOLO alone
+            return True     # too small for Haar
         kwargs = dict(scaleFactor=1.1, minNeighbors=1, minSize=(12, 12))
         if len(self.face_cascade.detectMultiScale(gray_roi, **kwargs)) > 0:
             return True
         return len(self.face_cascade_alt2.detectMultiScale(gray_roi, **kwargs)) > 0
-
-    # ------------------------------------------------------------------ #
-    # Candidate tracking                                                   #
-    # ------------------------------------------------------------------ #
 
     def _update_candidates(self, pos: np.ndarray) -> None:
         best_idx: int | None = None
@@ -277,10 +220,6 @@ class FaceDetector(Node):
         else:
             self.candidates.append({'pos': pos.copy(), 'count': 1})
 
-    # ------------------------------------------------------------------ #
-    # Marker publishing                                                    #
-    # ------------------------------------------------------------------ #
-
     def _publish_markers(self) -> None:
         if not self.confirmed_faces:
             return
@@ -291,11 +230,11 @@ class FaceDetector(Node):
         for i, pos in enumerate(self.confirmed_faces):
             sphere = Marker()
             sphere.header.frame_id = 'map'
-            sphere.header.stamp    = now
-            sphere.ns              = 'faces'
-            sphere.id              = i
-            sphere.type            = Marker.SPHERE
-            sphere.action          = Marker.ADD
+            sphere.header.stamp = now
+            sphere.ns = 'faces'
+            sphere.id = i
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
             sphere.pose.position.x = float(pos[0])
             sphere.pose.position.y = float(pos[1])
             sphere.pose.position.z = float(pos[2])
@@ -309,25 +248,22 @@ class FaceDetector(Node):
 
             label = Marker()
             label.header.frame_id = 'map'
-            label.header.stamp    = now
-            label.ns              = 'face_labels'
-            label.id              = i
-            label.type            = Marker.TEXT_VIEW_FACING
-            label.action          = Marker.ADD
+            label.header.stamp = now
+            label.ns = 'face_labels'
+            label.id = i
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
             label.pose.position.x = float(pos[0])
             label.pose.position.y = float(pos[1])
             label.pose.position.z = float(pos[2]) + 0.45
             label.pose.orientation.w = 1.0
-            label.scale.z  = 0.22
-            label.color.r  = label.color.g = label.color.b = 1.0
-            label.color.a  = 1.0
-            label.text     = f'Face {i + 1}'
+            label.scale.z = 0.22
+            label.color.r = label.color.g = label.color.b = 1.0
+            label.color.a = 1.0
+            label.text = f'Face {i + 1}'
             ma.markers.append(label)
 
         self.marker_pub.publish(ma)
-
-
-# --------------------------------------------------------------------------- #
 
 def main():
     print('Face detection node starting.')

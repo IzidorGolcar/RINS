@@ -42,12 +42,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
 from visualization_msgs.msg import MarkerArray
 
 sys.path.insert(0, os.path.dirname(__file__))
-from robot_commander import RobotCommander  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from robot_commander import RobotCommander  
 
 # Distance between parallel rows (and between points within each row).
 # 1.5 m works well for arenas up to ~10 × 10 m with OAK-D's ~3.5 m range.
@@ -60,53 +55,38 @@ COVERAGE_SPACING = 0.9      # metres
 # For tall arenas use 'x'; for wide arenas use 'y'.
 SWEEP_AXIS = 'x'
 
-# Minimum clearance from any occupied cell.  Should be >= robot radius.
+# Minimum clearance from any occupied cell.
 ROBOT_CLEARANCE  = 0.22     # metres
 
 # Hard bounding box for the competition arena (map frame, metres).
-# Waypoints outside this box are discarded, keeping the robot inside the
-# fenced area and off the bridge.
-#
 # How to set these values:
 #   1. Open RViz while the map is loaded.
 #   2. Hover the mouse over each inner corner of the fence.
 #   3. Read the (x, y) coordinates shown in the status bar at the bottom.
 #   4. Fill in the min/max below.
-#
-# Set to None to disable the filter (not recommended – robot may leave arena).
-
-# ARENA_X_MIN: float | None = -4.5
-# ARENA_X_MAX: float | None =  3.0
-# ARENA_Y_MIN: float | None = -1.0
-# ARENA_Y_MAX: float | None =  8.0
 
 ARENA_X_MIN: float | None =  None
 ARENA_X_MAX: float | None =  None
 ARENA_Y_MIN: float | None =  None
 ARENA_Y_MAX: float | None =  None
 
-NUM_FACES        = 6        # stop after greeting this many faces
-APPROACH_DIST    = 0.7      # metres – stand this far from the face
-GREETING_TEXT    = "Hello! I found your face. Pleased to meet you!"
-ESPEAK_SPEED     = 140      # words per minute
-LOOP_START_TEXT  = "Starting loop"
+NUM_FACES = 6        # stop after greeting this many faces
+APPROACH_DIST = 0.7      # metres – stand this far from the face
+GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
+ESPEAK_SPEED = 140      # words per minute
+LOOP_START_TEXT = "Starting loop"
 
-
-# ---------------------------------------------------------------------------
-
-# QoS for the latched /map topic
 _MAP_QOS = QoSProfile(
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
     reliability=QoSReliabilityPolicy.RELIABLE,
     history=QoSHistoryPolicy.KEEP_LAST,
     depth=1)
 
-
 class State(Enum):
     SEARCHING   = auto()
     APPROACHING = auto()
-    GREETING    = auto()
-    DONE        = auto()
+    GREETING = auto()
+    DONE = auto()
 
 
 class Task1Node(RobotCommander):
@@ -114,8 +94,6 @@ class Task1Node(RobotCommander):
 
     def __init__(self):
         super().__init__(node_name='task1')
-
-        # Coverage path – populated when the first /map message arrives
         self.coverage_waypoints: list[tuple[float, float, float]] = []
 
         # Face tracking
@@ -124,8 +102,8 @@ class Task1Node(RobotCommander):
         self.to_greet:     deque[int] = deque()
 
         # State machine
-        self.state            = State.SEARCHING
-        self.waypoint_idx     = 0
+        self.state = State.SEARCHING
+        self.waypoint_idx = 0
         self.current_face_id: int | None = None
 
         # Subscribe to the occupancy map (once) to build the coverage path
@@ -137,10 +115,6 @@ class Task1Node(RobotCommander):
             MarkerArray, '/people_markers', self._marker_cb, 10)
 
         self.info('Task1 node ready – waiting for map and Nav2.')
-
-    # ------------------------------------------------------------------
-    # Map callback – build boustrophedon path (runs once)
-    # ------------------------------------------------------------------
 
     def _map_cb(self, msg: OccupancyGrid) -> None:
         if self.coverage_waypoints:
@@ -154,22 +128,20 @@ class Task1Node(RobotCommander):
         """Generate a lawnmower path over the free cells of *grid*.
 
         Returns a list of (world_x, world_y, yaw_deg) tuples.
-        Headings are set so the robot faces toward the next waypoint,
-        giving natural forward-facing motion in each row.
         """
-        res   = grid.info.resolution
-        gw    = grid.info.width
-        gh    = grid.info.height
-        ox    = grid.info.origin.position.x
-        oy    = grid.info.origin.position.y
+        res = grid.info.resolution
+        gw = grid.info.width
+        gh = grid.info.height
+        ox = grid.info.origin.position.x
+        oy = grid.info.origin.position.y
 
         # Occupancy values: 0=free, 100=occupied, -1=unknown
         data = np.array(grid.data, dtype=np.int8).reshape(gh, gw)
 
-        step       = max(1, int(COVERAGE_SPACING / res))
-        clearance  = max(1, int(ROBOT_CLEARANCE  / res))
+        step = max(1, int(COVERAGE_SPACING / res))
+        clearance = max(1, int(ROBOT_CLEARANCE  / res))
 
-        waypoints: list[tuple[float, float]] = []   # (world_x, world_y)
+        waypoints: list[tuple[float, float]] = []
 
         def _cell_ok(iy: int, ix: int) -> bool:
             if data[iy, ix] != 0:
@@ -191,8 +163,6 @@ class Task1Node(RobotCommander):
             return True
 
         if SWEEP_AXIS == 'x':
-            # Vertical columns: outer loop advances left-right (ix),
-            # inner loop sweeps up-down (iy), reversed every other column.
             col_idx = 0
             for ix in range(step // 2, gw, step):
                 iys = list(range(step // 2, gh, step))
@@ -205,8 +175,6 @@ class Task1Node(RobotCommander):
                         waypoints.append((wx, wy))
                 col_idx += 1
         else:
-            # Horizontal rows: outer loop advances bottom-top (iy),
-            # inner loop sweeps left-right (ix), reversed every other row.
             row_idx = 0
             for iy in range(step // 2, gh, step):
                 xs = list(range(step // 2, gw, step))
@@ -223,7 +191,6 @@ class Task1Node(RobotCommander):
             self.warn('Boustrophedon: no free cells found – check map QoS.')
             return []
 
-        # Assign heading: each waypoint faces toward the next one
         result: list[tuple[float, float, float]] = []
         for i, (wx, wy) in enumerate(waypoints):
             if i < len(waypoints) - 1:
@@ -234,10 +201,6 @@ class Task1Node(RobotCommander):
             result.append((wx, wy, yaw_deg))
 
         return result
-
-    # ------------------------------------------------------------------
-    # /people_markers callback
-    # ------------------------------------------------------------------
 
     def _marker_cb(self, msg: MarkerArray) -> None:
         for m in msg.markers:
@@ -254,18 +217,10 @@ class Task1Node(RobotCommander):
                     f'New face #{fid} queued at '
                     f'({pos[0]:.2f}, {pos[1]:.2f})')
 
-    # ------------------------------------------------------------------
-    # Navigation helpers
-    # ------------------------------------------------------------------
-
     def _spin_ros(self, timeout: float = 0.1) -> None:
         rclpy.spin_once(self, timeout_sec=timeout)
 
     def _wait_nav(self, allow_interrupt: bool = True) -> bool:
-        """Spin until current Nav2 goal finishes.
-
-        Returns True on completion, False if interrupted by a queued face.
-        """
         while not self.isTaskComplete():
             self._spin_ros()
             if allow_interrupt and self.to_greet:
@@ -277,14 +232,13 @@ class Task1Node(RobotCommander):
     def _go_waypoint(self, x: float, y: float, yaw_deg: float) -> None:
         goal = PoseStamped()
         goal.header.frame_id = 'map'
-        goal.header.stamp    = self.get_clock().now().to_msg()
+        goal.header.stamp = self.get_clock().now().to_msg()
         goal.pose.position.x = x
         goal.pose.position.y = y
         goal.pose.orientation = self.YawToQuaternion(math.radians(yaw_deg))
         self.goToPose(goal)
 
     def _approach_pose(self, face_id: int) -> PoseStamped:
-        """PoseStamped ~APPROACH_DIST m in front of face, facing it."""
         fx, fy, fz = self.known_faces[face_id]
 
         if hasattr(self, 'current_pose'):
@@ -300,22 +254,18 @@ class Task1Node(RobotCommander):
         else:
             dx, dy = dx / length, dy / length
 
-        ax  = fx + dx * APPROACH_DIST
-        ay  = fy + dy * APPROACH_DIST
+        ax = fx + dx * APPROACH_DIST
+        ay = fy + dy * APPROACH_DIST
         yaw = math.atan2(fy - ay, fx - ax)
 
         goal = PoseStamped()
         goal.header.frame_id = 'map'
-        goal.header.stamp    = self.get_clock().now().to_msg()
+        goal.header.stamp = self.get_clock().now().to_msg()
         goal.pose.position.x = ax
         goal.pose.position.y = ay
         goal.pose.position.z = 0.0
         goal.pose.orientation = self.YawToQuaternion(yaw)
         return goal
-
-    # ------------------------------------------------------------------
-    # Greeting
-    # ------------------------------------------------------------------
 
     def _greet(self) -> None:
         self.info(f'Speaking: "{GREETING_TEXT}"')
@@ -334,14 +284,9 @@ class Task1Node(RobotCommander):
         while proc.poll() is None:
             self._spin_ros(timeout=0.05)
 
-    # ------------------------------------------------------------------
-    # Main state machine
-    # ------------------------------------------------------------------
-
     def run(self) -> None:
         self.waitUntilNav2Active()
 
-        # Wait for the boustrophedon path to be computed from /map
         self.info('Waiting for /map to build coverage path...')
         while not self.coverage_waypoints and rclpy.ok():
             self._spin_ros(0.1)
@@ -365,13 +310,10 @@ class Task1Node(RobotCommander):
         self._say(LOOP_START_TEXT)
 
         while rclpy.ok():
-
-            # ── DONE ──────────────────────────────────────────────────
             if self.state == State.DONE:
                 self.info(f'All {NUM_FACES} faces greeted.  Task complete!')
                 break
 
-            # ── SEARCHING ─────────────────────────────────────────────
             elif self.state == State.SEARCHING:
 
                 if self.to_greet:
@@ -404,7 +346,6 @@ class Task1Node(RobotCommander):
                     if self.to_greet:
                         self.state = State.APPROACHING
 
-            # ── APPROACHING ───────────────────────────────────────────
             elif self.state == State.APPROACHING:
 
                 face_id = self.to_greet.popleft()
@@ -419,9 +360,7 @@ class Task1Node(RobotCommander):
                 self._wait_nav(allow_interrupt=False)
                 self.state = State.GREETING
 
-            # ── GREETING ──────────────────────────────────────────────
             elif self.state == State.GREETING:
-
                 face_id = self.current_face_id
                 self._greet()
                 self.greeted_ids.add(face_id)
@@ -429,14 +368,8 @@ class Task1Node(RobotCommander):
                     f'Greeted face #{face_id}.  '
                     f'Total: {len(self.greeted_ids)}/{NUM_FACES}.')
 
-                self.state = (State.DONE
-                              if len(self.greeted_ids) >= NUM_FACES
-                              else State.SEARCHING)
-
+                self.state = (State.DONE if len(self.greeted_ids) >= NUM_FACES else State.SEARCHING)
             self._spin_ros()
-
-
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     print('Task 1 node starting.')
