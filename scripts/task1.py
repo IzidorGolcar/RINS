@@ -39,7 +39,10 @@ ARENA_Y_MAX: float | None =  None
 
 NUM_FACES = 3
 NUM_RINGS = 2
-APPROACH_DIST = 0.7      
+APPROACH_DIST = 0.7
+# Max distance (m) at which a detected goal triggers immediate approach.
+# If the goal is farther away, it is deferred until the robot is closer.
+IMMEDIATE_APPROACH_DIST = 3.0
 GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
 ESPEAK_SPEED = 140      # words per minute
@@ -116,6 +119,10 @@ class Task1Node(RobotCommander):
         self.waypoint_idx     = 0
         self.current_face_id: int | None = None
         self.current_ring_id: int | None = None
+        self.approach_fail_count: dict[int, int] = {}  # id -> retry count
+        self.MAX_APPROACH_RETRIES = 3
+        self.waypoint_fail_count = 0
+        self.MAX_WAYPOINT_RETRIES = 2
 
         self.create_subscription(
             OccupancyGrid, '/map', self._map_cb, _MAP_QOS)
@@ -273,6 +280,49 @@ class Task1Node(RobotCommander):
                         f'({pos[0]:.2f}, {pos[1]:.2f})')
 
 
+    def _has_nearby_goal(self) -> bool:
+        """Return True if any queued face/ring is within IMMEDIATE_APPROACH_DIST."""
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            return bool(self.to_greet or self.to_greet_rings)
+        rx = self.current_pose.pose.position.x
+        ry = self.current_pose.pose.position.y
+        for fid in self.to_greet:
+            fx, fy, _ = self.known_faces[fid]
+            if math.hypot(fx - rx, fy - ry) <= IMMEDIATE_APPROACH_DIST:
+                return True
+        for rid in self.to_greet_rings:
+            rx2, ry2, _ = self.known_rings[rid]
+            if math.hypot(rx2 - rx, ry2 - ry) <= IMMEDIATE_APPROACH_DIST:
+                return True
+        return False
+
+    def _pop_nearest_goal(self) -> tuple[str, int]:
+        """Pop and return ('face', id) or ('ring', id) for the nearest queued goal."""
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            if self.to_greet:
+                return ('face', self.to_greet.popleft())
+            return ('ring', self.to_greet_rings.popleft())
+        rx = self.current_pose.pose.position.x
+        ry = self.current_pose.pose.position.y
+        best_dist = float('inf')
+        best_type = 'face'
+        best_id = -1
+        for fid in self.to_greet:
+            fx, fy, _ = self.known_faces[fid]
+            d = math.hypot(fx - rx, fy - ry)
+            if d < best_dist:
+                best_dist, best_type, best_id = d, 'face', fid
+        for rid in self.to_greet_rings:
+            rx2, ry2, _ = self.known_rings[rid]
+            d = math.hypot(rx2 - rx, ry2 - ry)
+            if d < best_dist:
+                best_dist, best_type, best_id = d, 'ring', rid
+        if best_type == 'face':
+            self.to_greet.remove(best_id)
+        else:
+            self.to_greet_rings.remove(best_id)
+        return (best_type, best_id)
+
     def _spin_ros(self, timeout: float = 0.1) -> None:
         rclpy.spin_once(self, timeout_sec=timeout)
 
@@ -281,7 +331,7 @@ class Task1Node(RobotCommander):
         """
         while not self.isTaskComplete():
             self._spin_ros()
-            if allow_interrupt and (self.to_greet or self.to_greet_rings):
+            if allow_interrupt and self._has_nearby_goal():
                 self.cancelTask()
                 self.info('Navigation cancelled – new target queued.')
                 return False
@@ -381,7 +431,6 @@ class Task1Node(RobotCommander):
 
         self.info(
             f'Starting search over {len(self.coverage_waypoints)} waypoints.')
-        self._say("")
 
         while rclpy.ok():
 
@@ -394,11 +443,15 @@ class Task1Node(RobotCommander):
 
             elif self.state == State.SEARCHING:
 
-                if self.to_greet or self.to_greet_rings:
+                if self._has_nearby_goal():
                     self.state = State.APPROACHING
                     continue
 
                 if self.waypoint_idx >= len(self.coverage_waypoints):
+                    # Path done — approach any deferred goals before restarting
+                    if self.to_greet or self.to_greet_rings:
+                        self.state = State.APPROACHING
+                        continue
                     faces_done = len(self.greeted_ids) >= NUM_FACES
                     rings_done = len(self.greeted_ring_ids) >= NUM_RINGS
                     if faces_done and rings_done:
@@ -420,65 +473,77 @@ class Task1Node(RobotCommander):
                 self._go_waypoint(*wp)
 
                 if not self._wait_nav(allow_interrupt=True):
-                    self.state = State.APPROACHING
+                    if self._has_nearby_goal():
+                        self.waypoint_fail_count = 0
+                        self.state = State.APPROACHING
+                    else:
+                        self.waypoint_fail_count += 1
+                        if self.waypoint_fail_count >= self.MAX_WAYPOINT_RETRIES:
+                            self.warn(
+                                f'Skipping unreachable waypoint {self.waypoint_idx + 1} '
+                                f'at ({wp[0]:.2f}, {wp[1]:.2f}).')
+                            self.waypoint_idx += 1
+                            self.waypoint_fail_count = 0
                 else:
                     self.waypoint_idx += 1
-                    if self.to_greet or self.to_greet_rings:
+                    self.waypoint_fail_count = 0
+                    if self._has_nearby_goal():
                         self.state = State.APPROACHING
 
             elif self.state == State.APPROACHING:
 
-                if self.to_greet:
-                    face_id = self.to_greet.popleft()
-                    if face_id in self.greeted_ids:
-                        self.state = State.SEARCHING
-                        continue
+                if not (self.to_greet or self.to_greet_rings):
+                    self.state = State.SEARCHING
+                    continue
 
-                    self.current_face_id = face_id
+                goal_type, goal_id = self._pop_nearest_goal()
+
+                if goal_type == 'face':
+                    if goal_id in self.greeted_ids:
+                        continue
+                    self.current_face_id = goal_id
                     self.current_ring_id = None
-                    fx, fy, _ = self.known_faces[face_id]
+                    fx, fy, _ = self.known_faces[goal_id]
                     self.info(
-                        f'Approaching face #{face_id} at ({fx:.2f}, {fy:.2f}).')
-                    self.goToPose(self._approach_pose(face_id))
-
-                    completed = self._wait_nav(allow_interrupt=False)
-                    if completed:
-                        self.state = State.GREETING
-                    else:
-                        self.warn(
-                            f'Failed to reach approach pose for face #{face_id}. '
-                            f'Re-queuing.')
-                        self.to_greet.appendleft(face_id)
-                        self.current_face_id = None
-                        self.state = State.SEARCHING
-
-                elif self.to_greet_rings:
-                    ring_id = self.to_greet_rings.popleft()
-                    if ring_id in self.greeted_ring_ids:
-                        self.state = State.SEARCHING
-                        continue
-
-                    self.current_ring_id = ring_id
-                    self.current_face_id = None
-                    rx2, ry2, _ = self.known_rings[ring_id]
-                    color_name = _bgr_to_color_name(self.ring_colors[ring_id])
-                    self.info(
-                        f'Approaching {color_name} ring #{ring_id} '
-                        f'at ({rx2:.2f}, {ry2:.2f}).')
-                    self.goToPose(self._approach_pose_ring(ring_id))
-
-                    completed = self._wait_nav(allow_interrupt=False)
-                    if completed:
-                        self.state = State.GREETING
-                    else:
-                        self.warn(
-                            f'Failed to reach approach pose for ring #{ring_id}. '
-                            f'Re-queuing.')
-                        self.to_greet_rings.appendleft(ring_id)
-                        self.current_ring_id = None
-                        self.state = State.SEARCHING
-
+                        f'Approaching face #{goal_id} at ({fx:.2f}, {fy:.2f}).')
+                    self.goToPose(self._approach_pose(goal_id))
                 else:
+                    if goal_id in self.greeted_ring_ids:
+                        continue
+                    self.current_ring_id = goal_id
+                    self.current_face_id = None
+                    rx2, ry2, _ = self.known_rings[goal_id]
+                    color_name = _bgr_to_color_name(self.ring_colors[goal_id])
+                    self.info(
+                        f'Approaching {color_name} ring #{goal_id} '
+                        f'at ({rx2:.2f}, {ry2:.2f}).')
+                    self.goToPose(self._approach_pose_ring(goal_id))
+
+                completed = self._wait_nav(allow_interrupt=False)
+                if completed:
+                    self.state = State.GREETING
+                else:
+                    retries = self.approach_fail_count.get(goal_id, 0) + 1
+                    self.approach_fail_count[goal_id] = retries
+                    if retries >= self.MAX_APPROACH_RETRIES:
+                        self.warn(
+                            f'Giving up on {goal_type} #{goal_id} after '
+                            f'{retries} failed attempts.')
+                        if goal_type == 'face':
+                            self.greeted_ids.add(goal_id)
+                        else:
+                            self.greeted_ring_ids.add(goal_id)
+                    else:
+                        self.warn(
+                            f'Failed to reach {goal_type} #{goal_id} '
+                            f'(attempt {retries}/{self.MAX_APPROACH_RETRIES}). '
+                            f'Re-queuing.')
+                        if goal_type == 'face':
+                            self.to_greet.append(goal_id)
+                        else:
+                            self.to_greet_rings.append(goal_id)
+                    self.current_face_id = None
+                    self.current_ring_id = None
                     self.state = State.SEARCHING
 
             elif self.state == State.GREETING:
