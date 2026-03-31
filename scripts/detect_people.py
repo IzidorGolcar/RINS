@@ -13,7 +13,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
-import tf2_geometry_msgs  # noqa: F401 – registers PointStamped with tf2
+import tf2_geometry_msgs  
 import tf2_ros
 from ultralytics import YOLO
 from visualization_msgs.msg import Marker, MarkerArray
@@ -36,14 +36,13 @@ class FaceDetector(Node):
 
         self.bridge = CvBridge()
 
-        self.candidates:     list[dict]       = []
+        self.candidates: list[dict] = []
         self.confirmed_faces: list[np.ndarray] = []
 
-        # TF2
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Haar cascades – secondary filter, two training sets for coverage
+        # Haar cascades – secondary filter
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.face_cascade_alt2 = cv2.CascadeClassifier(
@@ -64,7 +63,6 @@ class FaceDetector(Node):
             slop=0.05)
         self.ts.registerCallback(self.synced_callback)
 
-        # Publisher
         self.marker_pub = self.create_publisher(
             MarkerArray, '/people_markers', QoSReliabilityPolicy.BEST_EFFORT)
 
@@ -227,11 +225,11 @@ class FaceDetector(Node):
         for i, pos in enumerate(self.confirmed_faces):
             sphere = Marker()
             sphere.header.frame_id = 'map'
-            sphere.header.stamp    = now
-            sphere.ns              = 'faces'
-            sphere.id              = i
-            sphere.type            = Marker.SPHERE
-            sphere.action          = Marker.ADD
+            sphere.header.stamp = now
+            sphere.ns = 'faces'
+            sphere.id = i
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
             sphere.pose.position.x = float(pos[0])
             sphere.pose.position.y = float(pos[1])
             sphere.pose.position.z = float(pos[2])
@@ -245,19 +243,19 @@ class FaceDetector(Node):
 
             label = Marker()
             label.header.frame_id = 'map'
-            label.header.stamp    = now
-            label.ns              = 'face_labels'
-            label.id              = i
-            label.type            = Marker.TEXT_VIEW_FACING
-            label.action          = Marker.ADD
+            label.header.stamp = now
+            label.ns = 'face_labels'
+            label.id = i
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
             label.pose.position.x = float(pos[0])
             label.pose.position.y = float(pos[1])
             label.pose.position.z = float(pos[2]) + 0.45
             label.pose.orientation.w = 1.0
-            label.scale.z  = 0.22
-            label.color.r  = label.color.g = label.color.b = 1.0
-            label.color.a  = 1.0
-            label.text     = f'Face {i + 1}'
+            label.scale.z = 0.22
+            label.color.r = label.color.g = label.color.b = 1.0
+            label.color.a = 1.0
+            label.text = f'Face {i + 1}'
             ma.markers.append(label)
 
         self.marker_pub.publish(ma)

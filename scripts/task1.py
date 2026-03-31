@@ -22,7 +22,7 @@ from robot_commander import RobotCommander  # noqa: E402
 # Distance between parallel rows (and between points within each row).
 # 1.5 m works well for arenas up to ~10 × 10 m with OAK-D's ~3.5 m range.
 # Increase for faster (but sparser) coverage; decrease for thoroughness.
-COVERAGE_SPACING = 0.9      # metres
+COVERAGE_SPACING = 0.9 # meters
 
 # Sweep axis for the boustrophedon:
 #   'y' – horizontal rows (robot sweeps left-right, rows advance up/down)
@@ -30,20 +30,19 @@ COVERAGE_SPACING = 0.9      # metres
 # For tall arenas use 'x'; for wide arenas use 'y'.
 SWEEP_AXIS = 'x'
 
-# Minimum clearance from any occupied cell.  Should be >= robot radius.
-ROBOT_CLEARANCE  = 0.22     # metres
+ROBOT_CLEARANCE  = 0.22   
 
 ARENA_X_MIN: float | None =  None
 ARENA_X_MAX: float | None =  None
 ARENA_Y_MIN: float | None =  None
 ARENA_Y_MAX: float | None =  None
 
-NUM_FACES        = 3
-NUM_RINGS        = 2
-APPROACH_DIST    = 0.7      # metres – stand this far from the face / ring
-GREETING_TEXT    = "Hello! I found your face. Pleased to meet you!"
+NUM_FACES = 3
+NUM_RINGS = 2
+APPROACH_DIST = 0.7      
+GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
-ESPEAK_SPEED     = 140      # words per minute
+ESPEAK_SPEED = 140      # words per minute
 
 
 def _bgr_to_color_name(bgr: tuple[int, int, int]) -> str:
@@ -60,7 +59,6 @@ def _bgr_to_color_name(bgr: tuple[int, int, int]) -> str:
             return 'black'
         return 'grey'
 
-    # Hue in [0, 360)
     if mx == r:
         h = 60.0 * ((g - b) / (mx - mn) % 6)
     elif mx == g:
@@ -92,30 +90,27 @@ _MAP_QOS = QoSProfile(
     history=QoSHistoryPolicy.KEEP_LAST,
     depth=1)
 
-
 class State(Enum):
     SEARCHING   = auto()
     APPROACHING = auto()
     GREETING    = auto()
     DONE        = auto()
 
-
 class Task1Node(RobotCommander):
     """Extends RobotCommander with boustrophedon search and face greeting."""
-
     def __init__(self):
         super().__init__(node_name='task1')
 
         self.coverage_waypoints: list[tuple[float, float, float]] = []
 
-        self.known_faces:  dict[int, tuple[float, float, float]] = {}
-        self.greeted_ids:  set[int]   = set()
-        self.to_greet:     deque[int] = deque()
+        self.known_faces: dict[int, tuple[float, float, float]] = {}
+        self.greeted_ids: set[int]   = set()
+        self.to_greet: deque[int] = deque()
 
-        self.known_rings:       dict[int, tuple[float, float, float]] = {}
-        self.ring_colors:       dict[int, tuple[int, int, int]]       = {}  # rid -> BGR
-        self.greeted_ring_ids:  set[int]   = set()
-        self.to_greet_rings:    deque[int] = deque()
+        self.known_rings: dict[int, tuple[float, float, float]] = {}
+        self.ring_colors: dict[int, tuple[int, int, int]] = {}  
+        self.greeted_ring_ids: set[int]   = set()
+        self.to_greet_rings: deque[int] = deque()
 
         self.state            = State.SEARCHING
         self.waypoint_idx     = 0
@@ -162,11 +157,8 @@ class Task1Node(RobotCommander):
 
 
     def _boustrophedon(self, grid: OccupancyGrid) -> list[tuple[float, float, float]]:
-        """Generate a lawnmower path over the free cells of *grid*.
-
+        """Generate a path over the free cells of *grid*.
         Returns a list of (world_x, world_y, yaw_deg) tuples.
-        Headings are set so the robot faces toward the next waypoint,
-        giving natural forward-facing motion in each row.
         """
         res   = grid.info.resolution
         gw    = grid.info.width
@@ -176,8 +168,8 @@ class Task1Node(RobotCommander):
 
         data = np.array(grid.data, dtype=np.int8).reshape(gh, gw)
 
-        step       = max(1, int(COVERAGE_SPACING / res))
-        clearance  = max(1, int(ROBOT_CLEARANCE  / res))
+        step = max(1, int(COVERAGE_SPACING / res))
+        clearance = max(1, int(ROBOT_CLEARANCE  / res))
 
         waypoints: list[tuple[float, float]] = []
 
@@ -213,7 +205,6 @@ class Task1Node(RobotCommander):
                         waypoints.append((wx, wy))
                 col_idx += 1
         else:
-
             row_idx = 0
             for iy in range(step // 2, gh, step):
                 xs = list(range(step // 2, gw, step))
@@ -287,8 +278,6 @@ class Task1Node(RobotCommander):
 
     def _wait_nav(self, allow_interrupt: bool = True) -> bool:
         """Spin until current Nav2 goal finishes.
-
-        Returns True on successful completion, False if interrupted or failed.
         """
         while not self.isTaskComplete():
             self._spin_ros()
@@ -315,19 +304,14 @@ class Task1Node(RobotCommander):
         self.goToPose(goal)
 
     def _approach_pose(self, face_id: int) -> PoseStamped:
-        """PoseStamped ~APPROACH_DIST m in front of face, facing it."""
         fx, fy, fz = self.known_faces[face_id]
         return self._approach_pose_for(fx, fy, fz)
 
     def _approach_pose_ring(self, ring_id: int) -> PoseStamped:
-        """PoseStamped ~APPROACH_DIST m in front of ring, facing it."""
         rx2, ry2, rz2 = self.known_rings[ring_id]
         return self._approach_pose_for(rx2, ry2, rz2)
 
     def _approach_pose_for(self, fx: float, fy: float, fz: float) -> PoseStamped:
-        """Compute approach PoseStamped for any (fx, fy, fz) target."""
-        # FIX: use current_pose if available, but log a warning if it isn't,
-        # since falling back to (0, 0) produces a bogus approach direction.
         if hasattr(self, 'current_pose') and self.current_pose is not None:
             rx = self.current_pose.pose.position.x
             ry = self.current_pose.pose.position.y
@@ -350,7 +334,7 @@ class Task1Node(RobotCommander):
 
         goal = PoseStamped()
         goal.header.frame_id = 'map'
-        goal.header.stamp    = self.get_clock().now().to_msg()
+        goal.header.stamp = self.get_clock().now().to_msg()
         goal.pose.position.x = ax
         goal.pose.position.y = ay
         goal.pose.position.z = 0.0
@@ -457,10 +441,6 @@ class Task1Node(RobotCommander):
                         f'Approaching face #{face_id} at ({fx:.2f}, {fy:.2f}).')
                     self.goToPose(self._approach_pose(face_id))
 
-                    # FIX: check whether approach navigation actually succeeded
-                    # before transitioning to GREETING. If it failed, re-queue
-                    # the face and go back to searching rather than greeting
-                    # from wherever the robot currently is.
                     completed = self._wait_nav(allow_interrupt=False)
                     if completed:
                         self.state = State.GREETING
@@ -487,7 +467,6 @@ class Task1Node(RobotCommander):
                         f'at ({rx2:.2f}, {ry2:.2f}).')
                     self.goToPose(self._approach_pose_ring(ring_id))
 
-                    # FIX: same fix as for faces – only greet after confirmed arrival
                     completed = self._wait_nav(allow_interrupt=False)
                     if completed:
                         self.state = State.GREETING

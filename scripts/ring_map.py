@@ -30,7 +30,6 @@ class RingMap:
         self.Q = np.eye(3) * 0.01
 
     def _nearest(self, pos: np.ndarray) -> Optional[tuple[int, float]]:
-        """Return (index, distance) of nearest landmark, or None."""
         best_i, best_d = None, float('inf')
         for i, lm in enumerate(self.landmarks):
             d = np.linalg.norm(lm.position - pos)

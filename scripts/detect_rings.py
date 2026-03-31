@@ -270,35 +270,35 @@ class RingDetector(Node):
             sphere = Marker()
             b, g, r = [c / 255.0 for c in lm.color]
             sphere.header.frame_id = 'map'
-            sphere.header.stamp    = now
-            sphere.ns              = 'confirmed_rings'
-            sphere.id              = lm.id
-            sphere.type            = Marker.SPHERE
-            sphere.action          = Marker.ADD
+            sphere.header.stamp = now
+            sphere.ns = 'confirmed_rings'
+            sphere.id = lm.id
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
             sphere.pose.position.x = float(lm.position[0])
             sphere.pose.position.y = float(lm.position[1])
             sphere.pose.position.z = float(lm.position[2])
             sphere.pose.orientation.w = 1.0
-            sphere.scale           = Vector3(x=0.15, y=0.15, z=0.15)
-            sphere.color           = ColorRGBA(r=r, g=g, b=b, a=1.0)
-            sphere.lifetime.sec    = 0
+            sphere.scale = Vector3(x=0.15, y=0.15, z=0.15)
+            sphere.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+            sphere.lifetime.sec = 0
 
             marker_array.markers.append(sphere)
 
             label = Marker()
             label.header.frame_id = 'map'
-            label.header.stamp    = now
-            label.ns              = 'confirmed_rings_labels'
-            label.id              = lm.id
-            label.type            = Marker.TEXT_VIEW_FACING
-            label.action          = Marker.ADD
+            label.header.stamp = now
+            label.ns = 'confirmed_rings_labels'
+            label.id = lm.id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
             sphere.pose.position.x = float(lm.position[0])
             sphere.pose.position.y = float(lm.position[1])
             sphere.pose.position.z = float(lm.position[2])
             label.pose.orientation.w = 1.0
-            sphere.scale           = Vector3(x=0.15, y=0.15, z=0.15)
-            label.color           = ColorRGBA(r=r, g=g, b=b, a=1.0)
-            label.text     = f'Ring {lm.id}'
+            sphere.scale = Vector3(x=0.15, y=0.15, z=0.15)
+            label.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+            label.text = f'Ring {lm.id}'
             marker_array.markers.append(label)
 
         if len(marker_array.markers) > 0:
