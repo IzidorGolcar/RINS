@@ -32,6 +32,7 @@ install(PROGRAMS
   scripts/detect_people.py
   scripts/task1.py
   scripts/detect_rings.py
+  scripts/ring_map.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
