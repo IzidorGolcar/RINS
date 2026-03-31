@@ -28,6 +28,7 @@ install(DIRECTORY
 )
 
 install(PROGRAMS
+  scripts/robot_commander.py
   scripts/detect_people.py
   scripts/task1.py
   scripts/detect_rings.py
