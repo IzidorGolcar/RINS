@@ -1,31 +1,4 @@
 #!/usr/bin/env python3
-"""
-Task 1 - autonomous face search and greeting.
-
-Coverage strategy
------------------
-On startup the node reads the live /map occupancy grid and generates a
-boustrophedon (lawnmower) coverage path automatically.  The only parameter
-you need to tune is COVERAGE_SPACING (row/column pitch in metres).  Smaller
-→ denser coverage, more waypoints; larger → faster but risks gaps.
-
-No 360° spin is performed at each waypoint.  The robot faces forward as it
-drives, and detect_people.py runs continuously in parallel – faces are
-discovered in transit, not just at stop points.
-
-State machine
--------------
-  SEARCHING  → drive to the next boustrophedon waypoint
-     ↓  new face appears in /people_markers while navigating → cancel leg
-  APPROACHING → navigate to APPROACH_DIST metres in front of the face
-     ↓
-  GREETING   → espeak-ng greeting; mark face done
-     ↓
-  SEARCHING  → continue from next waypoint
-     ↓  all NUM_FACES faces greeted (or path exhausted and re-looped)
-  DONE
-"""
-
 import math
 import os
 import subprocess
@@ -33,6 +6,7 @@ import sys
 from collections import deque
 from enum import Enum, auto
 
+import random
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
@@ -44,10 +18,6 @@ from visualization_msgs.msg import MarkerArray
 sys.path.insert(0, os.path.dirname(__file__))
 from robot_commander import RobotCommander  # noqa: E402
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 # Distance between parallel rows (and between points within each row).
 # 1.5 m works well for arenas up to ~10 × 10 m with OAK-D's ~3.5 m range.
@@ -63,35 +33,17 @@ SWEEP_AXIS = 'x'
 # Minimum clearance from any occupied cell.  Should be >= robot radius.
 ROBOT_CLEARANCE  = 0.22     # metres
 
-# Hard bounding box for the competition arena (map frame, metres).
-# Waypoints outside this box are discarded, keeping the robot inside the
-# fenced area and off the bridge.
-#
-# How to set these values:
-#   1. Open RViz while the map is loaded.
-#   2. Hover the mouse over each inner corner of the fence.
-#   3. Read the (x, y) coordinates shown in the status bar at the bottom.
-#   4. Fill in the min/max below.
-#
-# Set to None to disable the filter (not recommended – robot may leave arena).
-
-# ARENA_X_MIN: float | None = -4.5
-# ARENA_X_MAX: float | None =  3.0
-# ARENA_Y_MIN: float | None = -1.0
-# ARENA_Y_MAX: float | None =  8.0
-
 ARENA_X_MIN: float | None =  None
 ARENA_X_MAX: float | None =  None
 ARENA_Y_MIN: float | None =  None
 ARENA_Y_MAX: float | None =  None
 
-NUM_FACES        = 3        # stop after greeting this many faces
-NUM_RINGS        = 2        # stop after greeting this many rings
+NUM_FACES        = 3
+NUM_RINGS        = 2
 APPROACH_DIST    = 0.7      # metres – stand this far from the face / ring
 GREETING_TEXT    = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
 ESPEAK_SPEED     = 140      # words per minute
-LOOP_START_TEXT  = "Starting loop"
 
 
 def _bgr_to_color_name(bgr: tuple[int, int, int]) -> str:
@@ -189,6 +141,26 @@ class Task1Node(RobotCommander):
             f'Coverage path ready: {len(self.coverage_waypoints)} waypoints '
             f'(spacing={COVERAGE_SPACING} m).')
 
+    def sort_by_nearest_neighbor(self, coords: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not coords:
+            return []
+        if len(coords) == 1:
+            return list(coords)
+
+        unvisited = list(coords)
+        current = unvisited.pop(random.randrange(len(unvisited)))
+        path = [current]
+
+        while unvisited:
+            cx, cy = current
+            nearest = min(unvisited, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
+            unvisited.remove(nearest)
+            path.append(nearest)
+            current = nearest
+
+        return path
+
+
     def _boustrophedon(self, grid: OccupancyGrid) -> list[tuple[float, float, float]]:
         """Generate a lawnmower path over the free cells of *grid*.
 
@@ -258,6 +230,8 @@ class Task1Node(RobotCommander):
             self.warn('Boustrophedon: no free cells found – check map QoS.')
             return []
 
+        waypoints = self.sort_by_nearest_neighbor(waypoints)
+
         result: list[tuple[float, float, float]] = []
         for i, (wx, wy) in enumerate(waypoints):
             if i < len(waypoints) - 1:
@@ -314,7 +288,7 @@ class Task1Node(RobotCommander):
     def _wait_nav(self, allow_interrupt: bool = True) -> bool:
         """Spin until current Nav2 goal finishes.
 
-        Returns True on completion, False if interrupted by a queued face.
+        Returns True on successful completion, False if interrupted or failed.
         """
         while not self.isTaskComplete():
             self._spin_ros()
@@ -322,6 +296,13 @@ class Task1Node(RobotCommander):
                 self.cancelTask()
                 self.info('Navigation cancelled – new target queued.')
                 return False
+
+        # Check the actual result status – treat anything other than SUCCEEDED as failure
+        result = self.getResult()
+        if result and str(result) != 'TaskResult.SUCCEEDED':
+            self.warn(f'Navigation finished with non-success result: {result}')
+            return False
+
         return True
 
     def _go_waypoint(self, x: float, y: float, yaw_deg: float) -> None:
@@ -345,10 +326,15 @@ class Task1Node(RobotCommander):
 
     def _approach_pose_for(self, fx: float, fy: float, fz: float) -> PoseStamped:
         """Compute approach PoseStamped for any (fx, fy, fz) target."""
-        if hasattr(self, 'current_pose'):
+        # FIX: use current_pose if available, but log a warning if it isn't,
+        # since falling back to (0, 0) produces a bogus approach direction.
+        if hasattr(self, 'current_pose') and self.current_pose is not None:
             rx = self.current_pose.pose.position.x
             ry = self.current_pose.pose.position.y
         else:
+            self.warn(
+                'current_pose not available – approach direction may be wrong. '
+                'Ensure RobotCommander subscribes to a pose topic.')
             rx, ry = 0.0, 0.0
 
         dx, dy = rx - fx, ry - fy
@@ -397,7 +383,7 @@ class Task1Node(RobotCommander):
         while not self.coverage_waypoints and rclpy.ok():
             self._spin_ros(0.1)
 
-        if hasattr(self, 'current_pose'):
+        if hasattr(self, 'current_pose') and self.current_pose is not None:
             rx = self.current_pose.pose.position.x
             ry = self.current_pose.pose.position.y
             dists = [math.hypot(wx - rx, wy - ry)
@@ -411,7 +397,7 @@ class Task1Node(RobotCommander):
 
         self.info(
             f'Starting search over {len(self.coverage_waypoints)} waypoints.')
-        self._say(LOOP_START_TEXT)
+        self._say("")
 
         while rclpy.ok():
 
@@ -419,6 +405,7 @@ class Task1Node(RobotCommander):
                 self.info(
                     f'All {NUM_FACES} faces and {NUM_RINGS} rings greeted. '
                     f'Task complete!')
+                self._say("I'm done! That was easy!")
                 break
 
             elif self.state == State.SEARCHING:
@@ -437,7 +424,6 @@ class Task1Node(RobotCommander):
                             'Path exhausted; restarting '
                             f'({len(self.greeted_ids)}/{NUM_FACES} faces, '
                             f'{len(self.greeted_ring_ids)}/{NUM_RINGS} rings greeted).')
-                        self._say(LOOP_START_TEXT)
                         self.waypoint_idx = 0
                     continue
 
@@ -470,8 +456,21 @@ class Task1Node(RobotCommander):
                     self.info(
                         f'Approaching face #{face_id} at ({fx:.2f}, {fy:.2f}).')
                     self.goToPose(self._approach_pose(face_id))
-                    self._wait_nav(allow_interrupt=False)
-                    self.state = State.GREETING
+
+                    # FIX: check whether approach navigation actually succeeded
+                    # before transitioning to GREETING. If it failed, re-queue
+                    # the face and go back to searching rather than greeting
+                    # from wherever the robot currently is.
+                    completed = self._wait_nav(allow_interrupt=False)
+                    if completed:
+                        self.state = State.GREETING
+                    else:
+                        self.warn(
+                            f'Failed to reach approach pose for face #{face_id}. '
+                            f'Re-queuing.')
+                        self.to_greet.appendleft(face_id)
+                        self.current_face_id = None
+                        self.state = State.SEARCHING
 
                 elif self.to_greet_rings:
                     ring_id = self.to_greet_rings.popleft()
@@ -487,8 +486,18 @@ class Task1Node(RobotCommander):
                         f'Approaching {color_name} ring #{ring_id} '
                         f'at ({rx2:.2f}, {ry2:.2f}).')
                     self.goToPose(self._approach_pose_ring(ring_id))
-                    self._wait_nav(allow_interrupt=False)
-                    self.state = State.GREETING
+
+                    # FIX: same fix as for faces – only greet after confirmed arrival
+                    completed = self._wait_nav(allow_interrupt=False)
+                    if completed:
+                        self.state = State.GREETING
+                    else:
+                        self.warn(
+                            f'Failed to reach approach pose for ring #{ring_id}. '
+                            f'Re-queuing.')
+                        self.to_greet_rings.appendleft(ring_id)
+                        self.current_ring_id = None
+                        self.state = State.SEARCHING
 
                 else:
                     self.state = State.SEARCHING
