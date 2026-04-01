@@ -105,6 +105,8 @@ class Task1Node(RobotCommander):
         super().__init__(node_name='task1')
 
         self.coverage_waypoints: list[tuple[float, float, float]] = []
+        self._map_info = None
+        self._map_data: np.ndarray | None = None
 
         self.known_faces: dict[int, tuple[float, float, float]] = {}
         self.greeted_ids: set[int]   = set()
@@ -136,6 +138,9 @@ class Task1Node(RobotCommander):
         self.info('Task1 node ready – waiting for map and Nav2.')
 
     def _map_cb(self, msg: OccupancyGrid) -> None:
+        self._map_info = msg.info
+        self._map_data = np.array(msg.data, dtype=np.int8).reshape(
+            msg.info.height, msg.info.width)
         if self.coverage_waypoints:
             return      # already computed
         self.coverage_waypoints = self._boustrophedon(msg)
@@ -361,25 +366,54 @@ class Task1Node(RobotCommander):
         rx2, ry2, rz2 = self.known_rings[ring_id]
         return self._approach_pose_for(rx2, ry2, rz2)
 
+    def _clearance_at(self, wx: float, wy: float) -> float:
+        """Return distance (m) to nearest obstacle at world position (wx, wy).
+        Returns 0 if outside map or on obstacle, large value if fully clear."""
+        if self._map_info is None or self._map_data is None:
+            return float('inf')
+        res = self._map_info.resolution
+        ox  = self._map_info.origin.position.x
+        oy  = self._map_info.origin.position.y
+        ix  = int((wx - ox) / res)
+        iy  = int((wy - oy) / res)
+        gh, gw = self._map_data.shape
+        if not (0 <= ix < gw and 0 <= iy < gh):
+            return 0.0
+        if self._map_data[iy, ix] != 0:
+            return 0.0
+        # Expand a square patch until we hit an obstacle or the edge
+        for r in range(1, max(gw, gh)):
+            y0, y1 = max(0, iy - r), min(gh, iy + r + 1)
+            x0, x1 = max(0, ix - r), min(gw, ix + r + 1)
+            patch = self._map_data[y0:y1, x0:x1]
+            if np.any(patch == 100):
+                return r * res
+        return float('inf')
+
     def _approach_pose_for(self, fx: float, fy: float, fz: float) -> PoseStamped:
         if hasattr(self, 'current_pose') and self.current_pose is not None:
             rx = self.current_pose.pose.position.x
             ry = self.current_pose.pose.position.y
         else:
-            self.warn(
-                'current_pose not available – approach direction may be wrong. '
-                'Ensure RobotCommander subscribes to a pose topic.')
             rx, ry = 0.0, 0.0
 
         dx, dy = rx - fx, ry - fy
         length = math.hypot(dx, dy)
-        if length < 1e-3:
-            dx, dy = 1.0, 0.0
-        else:
-            dx, dy = dx / length, dy / length
+        base_angle = math.atan2(dy, dx) if length >= 1e-3 else 0.0
 
-        ax  = fx + dx * APPROACH_DIST
-        ay  = fy + dy * APPROACH_DIST
+        # Try 12 candidate angles (every 30°), pick the one with most clearance
+        best_ax, best_ay, best_clearance = None, None, -1.0
+        for i in range(12):
+            angle = base_angle + i * (math.pi / 6)
+            cdx, cdy = math.cos(angle), math.sin(angle)
+            ax = fx + cdx * APPROACH_DIST
+            ay = fy + cdy * APPROACH_DIST
+            c = self._clearance_at(ax, ay)
+            if c > best_clearance:
+                best_clearance = c
+                best_ax, best_ay = ax, ay
+
+        ax, ay = best_ax, best_ay
         yaw = math.atan2(fy - ay, fx - ax)
 
         goal = PoseStamped()
