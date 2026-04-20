@@ -11,9 +11,8 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
 from rclpy.qos import QoSReliabilityPolicy, qos_profile_sensor_data
-from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2 as pc2
-import tf2_geometry_msgs  
+from sensor_msgs.msg import CameraInfo, Image
+import tf2_geometry_msgs
 import tf2_ros
 from ultralytics import YOLO
 from visualization_msgs.msg import Marker, MarkerArray
@@ -49,23 +48,28 @@ class FaceDetector(Node):
             cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
 
         self.declare_parameters('', [
-            ('rgb_topic',   '/gemini/color/image_raw'),
-            ('depth_topic', '/gemini/depth_registered/points'),
+            ('rgb_topic',    '/gemini/color/image_raw'),
+            ('depth_topic',  '/gemini/depth/image_raw'),
+            ('camera_frame', 'gemini_color_frame'),
         ])
-        rgb_topic   = self.get_parameter('rgb_topic').get_parameter_value().string_value
-        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
+        rgb_topic      = self.get_parameter('rgb_topic').get_parameter_value().string_value
+        depth_topic    = self.get_parameter('depth_topic').get_parameter_value().string_value
+        self._camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
+
+        self.fx = self.fy = self.cx_p = self.cy_p = None
+        cam_info_topic = rgb_topic.rsplit('/', 1)[0] + '/camera_info'
+        self.create_subscription(CameraInfo, cam_info_topic,
+                                 self._cam_info_cb, qos_profile_sensor_data)
 
         rgb_sub = message_filters.Subscriber(
-            self, Image,
-            rgb_topic,
+            self, Image, rgb_topic,
             qos_profile=qos_profile_sensor_data)
-        pc_sub = message_filters.Subscriber(
-            self, PointCloud2,
-            depth_topic,
+        depth_sub = message_filters.Subscriber(
+            self, Image, depth_topic,
             qos_profile=qos_profile_sensor_data)
 
         self.ts = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, pc_sub],
+            [rgb_sub, depth_sub],
             queue_size=5,
             slop=0.05)
         self.ts.registerCallback(self.synced_callback)
@@ -82,9 +86,22 @@ class FaceDetector(Node):
             f'confirm after {self.CONFIRM_HITS} hits.')
 
 
-    def synced_callback(self, rgb_msg: Image, pc_msg: PointCloud2) -> None:
+    def _cam_info_cb(self, msg: CameraInfo) -> None:
+        if self.fx is None:
+            self.fx   = msg.k[0]
+            self.fy   = msg.k[4]
+            self.cx_p = msg.k[2]
+            self.cy_p = msg.k[5]
+            self.get_logger().info(
+                f'Camera intrinsics: fx={self.fx:.1f} fy={self.fy:.1f} '
+                f'cx={self.cx_p:.1f} cy={self.cy_p:.1f}')
+
+    def synced_callback(self, rgb_msg: Image, depth_msg: Image) -> None:
+        if self.fx is None:
+            return
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
+            cv_image    = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
+            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, '32FC1')
         except CvBridgeError as e:
             self.get_logger().error(str(e))
             return
@@ -98,10 +115,6 @@ class FaceDetector(Node):
             conf=self.CONFIDENCE_THRESH,
             device=self.device,
         )
-
-        h, w = pc_msg.height, pc_msg.width
-        pts = pc2.read_points_numpy(pc_msg, field_names=('x', 'y', 'z'))
-        pts = pts.reshape((h, w, 3))
 
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
         vis  = cv_image.copy()
@@ -130,31 +143,27 @@ class FaceDetector(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
 
                 r = self.DEPTH_SAMPLE_RADIUS
-                patch = pts[max(0, cy - r):cy + r + 1,
-                            max(0, cx - r):cx + r + 1, :]
-                flat  = patch.reshape(-1, 3)
-                valid_mask = (
-                    ~np.isnan(flat).any(axis=1) &
-                    ~(flat == 0).all(axis=1)
-                )
-                valid = flat[valid_mask]
+                patch = depth_image[max(0, cy - r):cy + r + 1,
+                                    max(0, cx - r):cx + r + 1]
+                valid = patch[np.isfinite(patch) & (patch > 0)]
                 if valid.size == 0:
                     continue
-                d = np.median(valid, axis=0)
+                z = float(np.median(valid))
 
-                dist = float(np.linalg.norm(d))
-                if not (self.MIN_DIST <= dist <= self.MAX_DIST):
-                    self.get_logger().debug(
-                        f'Skipping: dist={dist:.2f} m outside range')
+                if not (self.MIN_DIST <= z <= self.MAX_DIST):
+                    self.get_logger().debug(f'Skipping: z={z:.2f} m outside range')
                     continue
+
+                x_c = (cx - self.cx_p) * z / self.fx
+                y_c = (cy - self.cy_p) * z / self.fy
 
                 try:
                     pt_cam = PointStamped()
-                    pt_cam.header.frame_id = pc_msg.header.frame_id
+                    pt_cam.header.frame_id = self._camera_frame
                     pt_cam.header.stamp = Time(seconds=0).to_msg()
-                    pt_cam.point.x = float(d[0])
-                    pt_cam.point.y = float(d[1])
-                    pt_cam.point.z = float(d[2])
+                    pt_cam.point.x = float(z)
+                    pt_cam.point.y = float(-x_c)
+                    pt_cam.point.z = float(-y_c)
 
                     pt_map = self.tf_buffer.transform(
                         pt_cam, 'map',
