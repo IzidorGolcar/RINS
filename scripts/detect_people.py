@@ -48,13 +48,20 @@ class FaceDetector(Node):
         self.face_cascade_alt2 = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
 
+        self.declare_parameters('', [
+            ('rgb_topic',   '/gemini/color/image_raw'),
+            ('depth_topic', '/gemini/depth_registered/points'),
+        ])
+        rgb_topic   = self.get_parameter('rgb_topic').get_parameter_value().string_value
+        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
+
         rgb_sub = message_filters.Subscriber(
             self, Image,
-            '/oakd/rgb/preview/image_raw',
+            rgb_topic,
             qos_profile=qos_profile_sensor_data)
         pc_sub = message_filters.Subscriber(
             self, PointCloud2,
-            '/oakd/rgb/preview/depth/points',
+            depth_topic,
             qos_profile=qos_profile_sensor_data)
 
         self.ts = message_filters.ApproximateTimeSynchronizer(

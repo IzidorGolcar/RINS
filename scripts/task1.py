@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import math
-import os
-import subprocess
 import sys
+import time
 from collections import deque
 from enum import Enum, auto
 
@@ -13,8 +12,10 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                         QoSProfile, QoSReliabilityPolicy)
+from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
 
+import os
 sys.path.insert(0, os.path.dirname(__file__))
 from robot_commander import RobotCommander  # noqa: E402
 
@@ -134,6 +135,8 @@ class Task1Node(RobotCommander):
 
         self.create_subscription(
             MarkerArray, '/ring_markers', self._ring_marker_cb, 10)
+
+        self._speak_pub = self.create_publisher(String, '/speak', 10)
 
         self.info('Task1 node ready – waiting for map and Nav2.')
 
@@ -426,22 +429,20 @@ class Task1Node(RobotCommander):
         return goal
 
 
-    def _greet(self) -> None:
-        self.info(f'Speaking: "{GREETING_TEXT}"')
-        proc = subprocess.Popen(
-            ['espeak-ng', '-s', str(ESPEAK_SPEED), GREETING_TEXT],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
-        while proc.poll() is None:
+    def _say(self, text: str) -> None:
+        self.info(f'Speaking: "{text}"')
+        msg = String()
+        msg.data = text
+        self._speak_pub.publish(msg)
+        # Spin while the robot speaks (estimated from word count at ESPEAK_SPEED WPM)
+        words = len(text.split())
+        wait_sec = (words / ESPEAK_SPEED) * 60.0 + 1.5
+        end_time = time.time() + wait_sec
+        while time.time() < end_time:
             self._spin_ros(timeout=0.05)
 
-    def _say(self, text: str) -> None:
-        proc = subprocess.Popen(
-            ['espeak-ng', '-s', str(ESPEAK_SPEED), text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
-        while proc.poll() is None:
-            self._spin_ros(timeout=0.05)
+    def _greet(self) -> None:
+        self._say(GREETING_TEXT)
 
 
     def run(self) -> None:

@@ -32,8 +32,17 @@ class RingDetector(Node):
 
         self.bridge = CvBridge()
 
-        self.rgb_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/image_raw")
-        self.depth_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/depth")
+        self.declare_parameters('', [
+            ('rgb_topic',    '/gemini/color/image_raw'),
+            ('depth_topic',  '/gemini/depth/image_raw'),
+            ('camera_frame', 'gemini_color_frame'),
+        ])
+        self._rgb_topic    = self.get_parameter('rgb_topic').get_parameter_value().string_value
+        self._depth_topic  = self.get_parameter('depth_topic').get_parameter_value().string_value
+        self._camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
+
+        self.rgb_sub = message_filters.Subscriber(self, Image, self._rgb_topic)
+        self.depth_sub = message_filters.Subscriber(self, Image, self._depth_topic)
 
         self.stream = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
@@ -51,9 +60,10 @@ class RingDetector(Node):
         self.received_camera_info = False
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
+        cam_info_topic = self._rgb_topic.rsplit('/', 1)[0] + '/camera_info'
         self.cam_info_sub = self.create_subscription(
             CameraInfo,
-            '/oakd/rgb/preview/camera_info',
+            cam_info_topic,
             self.cam_info_callback,
             qos_profile
         )
@@ -226,7 +236,7 @@ class RingDetector(Node):
             return
 
         target_frame = 'map'
-        camera_frame = 'oakd_rgb_camera_frame'
+        camera_frame = self._camera_frame
 
         for ring in rings:
             (center, axes, _) = ring['ellipse']
