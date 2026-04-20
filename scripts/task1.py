@@ -13,7 +13,6 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                         QoSProfile, QoSReliabilityPolicy)
-from std_srvs.srv import Empty as EmptySrv
 from visualization_msgs.msg import MarkerArray
 
 import os
@@ -444,24 +443,8 @@ class Task1Node(RobotCommander):
         self._say(GREETING_TEXT)
 
 
-    def _global_localize(self) -> None:
-        """Spread AMCL particles across the whole map, then spin so laser data
-        lets AMCL converge to the true robot pose without a manual initial pose."""
-        client = self.create_client(EmptySrv, 'reinitialize_global_localization')
-        if not client.wait_for_service(timeout_sec=5.0):
-            self.warn('reinitialize_global_localization service not found – set pose manually in RViz')
-            return
-        client.call_async(EmptySrv.Request())
-        self.info('Global localization started – spinning to converge AMCL...')
-        for _ in range(2):
-            self.spin(spin_dist=math.pi * 2.1)
-            self._wait_nav(allow_interrupt=False)
-        self.info('Localization spin complete.')
-
     def run(self) -> None:
         self.waitUntilNav2Active()
-        self._global_localize()
-
         self.info('Waiting for /map to build coverage path...')
         while not self.coverage_waypoints and rclpy.ok():
             self._spin_ros(0.1)

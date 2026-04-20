@@ -33,6 +33,7 @@ install(PROGRAMS
   scripts/task1.py
   scripts/detect_rings.py
   scripts/ring_map.py
+  scripts/auto_localize.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

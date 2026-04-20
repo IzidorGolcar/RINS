@@ -15,7 +15,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
 import message_filters
 from geometry_msgs.msg import PointStamped
 from rclpy.time import Time
@@ -44,8 +44,12 @@ class RingDetector(Node):
         self._depth_topic  = self.get_parameter('depth_topic').get_parameter_value().string_value
         self._camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
 
-        self.rgb_sub = message_filters.Subscriber(self, Image, self._rgb_topic)
-        self.depth_sub = message_filters.Subscriber(self, Image, self._depth_topic)
+        self.rgb_sub = message_filters.Subscriber(
+            self, Image, self._rgb_topic,
+            qos_profile=qos_profile_sensor_data)
+        self.depth_sub = message_filters.Subscriber(
+            self, Image, self._depth_topic,
+            qos_profile=qos_profile_sensor_data)
 
         self.stream = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
@@ -68,7 +72,7 @@ class RingDetector(Node):
             CameraInfo,
             cam_info_topic,
             self.cam_info_callback,
-            qos_profile
+            qos_profile_sensor_data
         )
 
         self.ring_map = RingMap()
