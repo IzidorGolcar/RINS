@@ -58,6 +58,9 @@ class FaceDetector(Node):
 
         self.fx = self.fy = self.cx_p = self.cy_p = None
         cam_info_topic = rgb_topic.rsplit('/', 1)[0] + '/camera_info'
+        # Dual QoS: driver might publish camera_info as RELIABLE or BEST_EFFORT.
+        self.create_subscription(CameraInfo, cam_info_topic,
+                                 self._cam_info_cb, 10)
         self.create_subscription(CameraInfo, cam_info_topic,
                                  self._cam_info_cb, qos_profile_sensor_data)
 
@@ -68,10 +71,13 @@ class FaceDetector(Node):
             self, Image, depth_topic,
             qos_profile=qos_profile_sensor_data)
 
+        # Small sync queue + relaxed slop: prefer latest pair over stale ones
+        # on a high-latency wifi link. A large queue buffers old frames and
+        # makes the displayed image lag behind reality.
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub],
-            queue_size=5,
-            slop=0.05)
+            queue_size=3,
+            slop=0.2)
         self.ts.registerCallback(self.synced_callback)
 
         self.marker_pub = self.create_publisher(
@@ -97,8 +103,6 @@ class FaceDetector(Node):
                 f'cx={self.cx_p:.1f} cy={self.cy_p:.1f}')
 
     def synced_callback(self, rgb_msg: Image, depth_msg: Image) -> None:
-        if self.fx is None:
-            return
         try:
             cv_image    = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
             raw_depth   = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
@@ -108,6 +112,15 @@ class FaceDetector(Node):
                 depth_image = raw_depth.astype(np.float32)
         except CvBridgeError as e:
             self.get_logger().error(str(e))
+            return
+
+        if self.fx is None:
+            # Still display so user sees the feed is alive.
+            cv2.imshow('Face Detection', cv_image)
+            cv2.waitKey(1)
+            self.get_logger().warn(
+                'Waiting for camera_info – face localization disabled.',
+                throttle_duration_sec=5.0)
             return
 
         res = self.model.predict(

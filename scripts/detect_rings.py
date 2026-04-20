@@ -53,8 +53,8 @@ class RingDetector(Node):
 
         self.stream = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
-            queue_size=1,
-            slop=0.1
+            queue_size=3,
+            slop=0.2
         )
 
         self.stream.registerCallback(self.stream_callback)
@@ -68,12 +68,13 @@ class RingDetector(Node):
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
         cam_info_topic = self._rgb_topic.rsplit('/', 1)[0] + '/camera_info'
-        self.cam_info_sub = self.create_subscription(
-            CameraInfo,
-            cam_info_topic,
-            self.cam_info_callback,
-            qos_profile_sensor_data
-        )
+        # Subscribe with BOTH QoS profiles — camera_info publisher can be
+        # either RELIABLE or BEST_EFFORT depending on the driver build.
+        self.cam_info_sub_reliable = self.create_subscription(
+            CameraInfo, cam_info_topic, self.cam_info_callback, 10)
+        self.cam_info_sub_sensor = self.create_subscription(
+            CameraInfo, cam_info_topic, self.cam_info_callback,
+            qos_profile_sensor_data)
 
         self.ring_map = RingMap()
 
@@ -94,8 +95,6 @@ class RingDetector(Node):
 
 
     def stream_callback(self, rgb_data, depth_data):
-        if not self.received_camera_info:
-            return
         try:
             cv_image  = self.bridge.imgmsg_to_cv2(rgb_data, 'bgr8')
             raw_depth = self.bridge.imgmsg_to_cv2(depth_data, desired_encoding='passthrough')
@@ -103,12 +102,21 @@ class RingDetector(Node):
                 depth_image = raw_depth.astype(np.float32) / 1000.0
             else:
                 depth_image = raw_depth.astype(np.float32)
-
-            self.detect_rings(cv_image.copy(), depth_image.copy())
-
-            cv2.waitKey(1)
         except Exception as e:
             self.get_logger().error(f'{e}')
+            return
+
+        if not self.received_camera_info:
+            # Still show the raw feed so the user can see the stream is alive.
+            cv2.imshow('Detections', cv_image)
+            cv2.waitKey(1)
+            self.get_logger().warn(
+                'Waiting for camera_info – ring localization disabled.',
+                throttle_duration_sec=5.0)
+            return
+
+        self.detect_rings(cv_image.copy(), depth_image.copy())
+        cv2.waitKey(1)
 
     def estimate_height_from_ground(self, cy, avg_depth, img_h):
         H_cam = 1.05
