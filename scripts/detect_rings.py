@@ -194,17 +194,38 @@ class RingDetector(Node):
             cv2.putText(output, label, (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ring_color, 1)
         cv2.imshow('Detections', output)
 
-    def is_grey(self, bgr: tuple[int, int, int], sat_threshold: int = 20) -> bool:
+    def is_grey(self, bgr: tuple[int, int, int], sat_threshold: int = 28) -> bool:
         pixel = np.uint8([[list(bgr)]])
-        s = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0, 0, 1]
-        return int(s) <= sat_threshold
+        hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0, 0]
+        s, v = int(hsv[1]), int(hsv[2])
+        # Low saturation is grey/white/black. Very dark pixels are also noise.
+        return s <= sat_threshold or v < 30
 
-
+    def _is_hollow(self, img_depth, cx, cy, axes, avg_ring_depth,
+                   gap_thresh: float = 0.12) -> bool:
+        """Robust hollow check: the interior of a ring is either farther than
+        the ring band or invalid (laser/IR passes through).
+        Samples a patch half the minor axis wide around the centre."""
+        h, w = img_depth.shape[:2]
+        inner_r = max(2, int(min(axes) * 0.25))
+        y0, y1 = max(0, cy - inner_r), min(h, cy + inner_r + 1)
+        x0, x1 = max(0, cx - inner_r), min(w, cx + inner_r + 1)
+        patch = img_depth[y0:y1, x0:x1]
+        if patch.size == 0:
+            return False
+        invalid = np.sum(~np.isfinite(patch) | (patch <= 0.05))
+        farther = np.sum(np.isfinite(patch) & (patch > avg_ring_depth + gap_thresh))
+        total   = patch.size
+        # Either mostly invalid (laser passes through) or mostly farther.
+        return (invalid + farther) / float(total) >= 0.6
 
     def find_rings(self, label_map, img_rgb, img_depth):
         results = []
         (h, w) = label_map.shape
         unique_labels = np.unique(label_map)
+
+        # Minimum distance (pixels) from image border for a valid ring centre.
+        border = 6
 
         for val in unique_labels:
             if val == 0: continue
@@ -214,40 +235,72 @@ class RingDetector(Node):
 
             if self.is_grey(ring_color):
                 continue
-            
 
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
-                if len(cnt) < 5: continue
+                if len(cnt) < 8: continue
+
+                cnt_area = cv2.contourArea(cnt)
+                if cnt_area < 30:
+                    continue
 
                 ellipse = cv2.fitEllipse(cnt)
-                (center, axes, angle) = ellipse
+                (center, axes, _) = ellipse
                 cx, cy = int(center[0]), int(center[1])
 
-                inertia_ratio = min(axes) / max(axes) if max(axes) != 0 else 0
-                if inertia_ratio < 0.35: continue
+                # Reject shapes hugging the image border (incomplete).
+                if cx < border or cy < border or cx >= w - border or cy >= h - border:
+                    continue
 
-                if 0 <= cy < h and 0 <= cx < w:
-                    obj_depths = img_depth[mask > 0]
-                    valid_depths = obj_depths[np.isfinite(obj_depths)]
-                    if valid_depths.size == 0: continue
-                    avg_ring_depth = np.median(valid_depths)
+                major, minor = max(axes), min(axes)
+                if major <= 0:
+                    continue
 
-                    pixel_width = max(axes)
-                    physical_diameter = (pixel_width * avg_ring_depth) / self.fx
+                aspect = minor / major
+                if aspect < 0.40:
+                    continue
 
-                    center_depth = img_depth[cy, cx]
-                    is_hollow = not np.isfinite(center_depth) or (center_depth - avg_ring_depth) > 0.15
+                # Circularity: contour area vs ellipse area. A well-fit ring
+                # has a ratio near 1; irregular blobs score much lower.
+                ellipse_area = math.pi * 0.25 * major * minor
+                if ellipse_area <= 0:
+                    continue
+                circ = cnt_area / ellipse_area
+                if not (0.55 < circ < 1.25):
+                    continue
 
-                    height = self.estimate_height_from_ground(cy, avg_ring_depth, 240)
-                    if 0.08 < physical_diameter < 0.3 and is_hollow and (1.4 < height < 1.8):
+                if not (0 <= cy < h and 0 <= cx < w):
+                    continue
 
-                        results.append({
-                            'ellipse': ellipse,
-                            'color': ring_color,
-                            'depth': avg_ring_depth
-                        })
+                obj_depths = img_depth[mask > 0]
+                valid_depths = obj_depths[np.isfinite(obj_depths) & (obj_depths > 0.05)]
+                if valid_depths.size < 20:
+                    continue
+                avg_ring_depth = float(np.median(valid_depths))
+
+                # Require the ring band to have low depth spread. A flat poster
+                # or the wall has a tight spread; noise/depth artefacts don't.
+                depth_std = float(np.std(valid_depths))
+                if depth_std > 0.25:
+                    continue
+
+                physical_diameter = (major * avg_ring_depth) / self.fx
+
+                if not self._is_hollow(img_depth, cx, cy, axes, avg_ring_depth):
+                    continue
+
+                height = self.estimate_height_from_ground(cy, avg_ring_depth, 240)
+                if not (0.07 < physical_diameter < 0.35):
+                    continue
+                if not (1.35 < height < 1.85):
+                    continue
+
+                results.append({
+                    'ellipse': ellipse,
+                    'color': ring_color,
+                    'depth': avg_ring_depth,
+                })
         return results
 
     def localize(self, rings):
@@ -257,8 +310,18 @@ class RingDetector(Node):
         target_frame = 'map'
         camera_frame = self._camera_frame
 
+        # Skip silently until the map frame is available (AMCL still converging).
+        if not self.tf_buffer.can_transform(
+                target_frame, camera_frame, Time(),
+                timeout=rclpy.duration.Duration(seconds=0.05)):
+            self.get_logger().warn(
+                f'TF {camera_frame} -> {target_frame} not yet available; '
+                'ring localization paused.',
+                throttle_duration_sec=5.0)
+            return
+
         for ring in rings:
-            (center, axes, _) = ring['ellipse']
+            (center, _, _) = ring['ellipse']
             cx_px, cy_px = center
             depth = ring['depth']
 
@@ -268,7 +331,6 @@ class RingDetector(Node):
             pt_cam = PointStamped()
             pt_cam.header.frame_id = camera_frame
             pt_cam.header.stamp = Time().to_msg()
-            pt_cam.header.frame_id 
             pt_cam.point.x = float(depth)
             pt_cam.point.y = float(-X_cam_opt)
             pt_cam.point.z = float(-Y_cam_opt)
@@ -279,7 +341,8 @@ class RingDetector(Node):
                     timeout=rclpy.duration.Duration(seconds=0.1)
                 )
             except Exception as e:
-                self.get_logger().warn(f'TF transform failed: {e}')
+                self.get_logger().warn(
+                    f'TF transform failed: {e}', throttle_duration_sec=5.0)
                 continue
 
             pos = np.array([pt_world.point.x, pt_world.point.y, pt_world.point.z])
