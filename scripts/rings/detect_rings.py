@@ -21,7 +21,7 @@ from geometry_msgs.msg import PointStamped
 from rclpy.time import Time
 import tf2_geometry_msgs
 from sensor_msgs.msg import CameraInfo
-from ring_map import *
+from scripts.rings.ring_map import *
 
 qos_profile = QoSProfile(
           durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
