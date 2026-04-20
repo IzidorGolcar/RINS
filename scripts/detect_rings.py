@@ -1,5 +1,8 @@
 #!/usr/bin/python3
 
+import os
+os.environ.setdefault('QT_LOGGING_RULES', 'default.warning=false;qt.qpa.*=false')
+
 import rclpy
 from rclpy.node import Node
 import cv2, math
@@ -90,8 +93,12 @@ class RingDetector(Node):
         if not self.received_camera_info:
             return
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(rgb_data, 'bgr8')
-            depth_image = self.bridge.imgmsg_to_cv2(depth_data, '32FC1')
+            cv_image  = self.bridge.imgmsg_to_cv2(rgb_data, 'bgr8')
+            raw_depth = self.bridge.imgmsg_to_cv2(depth_data, desired_encoding='passthrough')
+            if raw_depth.dtype == np.uint16:
+                depth_image = raw_depth.astype(np.float32) / 1000.0
+            else:
+                depth_image = raw_depth.astype(np.float32)
 
             self.detect_rings(cv_image.copy(), depth_image.copy())
 

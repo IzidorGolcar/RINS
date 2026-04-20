@@ -73,10 +73,6 @@ class RingMap:
             lm.color_history.append(color)
 
     def confirmed_landmarks(self) -> List[RingLandmark]:
-        for lm in self.landmarks:
-            print('observations', lm.observations)
-            print('trace', np.trace(lm.covariance))
-
         return [
             lm for lm in self.landmarks
             if lm.observations >= RingLandmark.CONFIRM_OBS

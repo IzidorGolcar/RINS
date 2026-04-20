@@ -101,7 +101,11 @@ class FaceDetector(Node):
             return
         try:
             cv_image    = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
-            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, '32FC1')
+            raw_depth   = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            if raw_depth.dtype == np.uint16:
+                depth_image = raw_depth.astype(np.float32) / 1000.0
+            else:
+                depth_image = raw_depth.astype(np.float32)
         except CvBridgeError as e:
             self.get_logger().error(str(e))
             return

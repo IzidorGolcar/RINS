@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import subprocess
 import sys
 import time
 from collections import deque
@@ -12,7 +13,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                         QoSProfile, QoSReliabilityPolicy)
-from std_msgs.msg import String
+from std_srvs.srv import Empty as EmptySrv
 from visualization_msgs.msg import MarkerArray
 
 import os
@@ -135,8 +136,6 @@ class Task1Node(RobotCommander):
 
         self.create_subscription(
             MarkerArray, '/ring_markers', self._ring_marker_cb, 10)
-
-        self._speak_pub = self.create_publisher(String, '/speak', 10)
 
         self.info('Task1 node ready – waiting for map and Nav2.')
 
@@ -431,10 +430,10 @@ class Task1Node(RobotCommander):
 
     def _say(self, text: str) -> None:
         self.info(f'Speaking: "{text}"')
-        msg = String()
-        msg.data = text
-        self._speak_pub.publish(msg)
-        # Spin while the robot speaks (estimated from word count at ESPEAK_SPEED WPM)
+        subprocess.Popen(
+            ['espeak', '-s', str(ESPEAK_SPEED), text],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         words = len(text.split())
         wait_sec = (words / ESPEAK_SPEED) * 60.0 + 1.5
         end_time = time.time() + wait_sec
@@ -445,8 +444,23 @@ class Task1Node(RobotCommander):
         self._say(GREETING_TEXT)
 
 
+    def _global_localize(self) -> None:
+        """Spread AMCL particles across the whole map, then spin so laser data
+        lets AMCL converge to the true robot pose without a manual initial pose."""
+        client = self.create_client(EmptySrv, 'reinitialize_global_localization')
+        if not client.wait_for_service(timeout_sec=5.0):
+            self.warn('reinitialize_global_localization service not found – set pose manually in RViz')
+            return
+        client.call_async(EmptySrv.Request())
+        self.info('Global localization started – spinning to converge AMCL...')
+        for _ in range(2):
+            self.spin(spin_dist=math.pi * 2.1)
+            self._wait_nav(allow_interrupt=False)
+        self.info('Localization spin complete.')
+
     def run(self) -> None:
         self.waitUntilNav2Active()
+        self._global_localize()
 
         self.info('Waiting for /map to build coverage path...')
         while not self.coverage_waypoints and rclpy.ok():
