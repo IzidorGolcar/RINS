@@ -67,24 +67,16 @@ class ObjectDetector:
 
         return label_map
 
-    def _mode_filter(self, id_map: np.ndarray, kernel: np.ndarray,
-                     iterations: int) -> np.ndarray:
+    def _mode_filter(self, id_map: np.ndarray, kernel: np.ndarray, iterations: int) -> np.ndarray:
+        id_map_u8 = id_map.astype(np.uint8)  # works if n_clusters < 256
         for _ in range(iterations):
-            n_clusters = int(id_map.max()) + 1
-            vote_maps = np.stack([
-                cv2.filter2D(
-                    (id_map == cid).astype(np.float32), -1,
-                    kernel.astype(np.float32)
-                )
-                for cid in range(n_clusters)
-            ], axis=-1)
-            id_map = vote_maps.argmax(axis=-1).astype(np.int32)
-        return id_map
+            id_map_u8 = cv2.medianBlur(id_map_u8, ksize=kernel.shape[0])
+        return id_map_u8.astype(np.int32)
 
     def get_labels(
             self,
             image,
-            downscale_factor=2,
+            downscale_factor=3,
             n_clusters=10,
             sample_size=10_000,
             min_area=3200,

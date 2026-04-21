@@ -30,8 +30,10 @@ install(DIRECTORY
 install(PROGRAMS
   scripts/robot_commander.py
   scripts/faces/detect_people.py
+  scripts/faces/detect_people2.py
   scripts/task1.py
   scripts/rings/detect_rings.py
+  scripts/rings/detect_rings2.py
   scripts/rings/ring_map.py
   scripts/rings/color_segmentation.py
   scripts/auto_localize.py
