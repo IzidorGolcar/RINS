@@ -21,7 +21,7 @@ from geometry_msgs.msg import PointStamped
 from rclpy.time import Time
 import tf2_geometry_msgs
 from sensor_msgs.msg import CameraInfo
-from scripts.rings.ring_map import *
+from ring_map import *
 
 qos_profile = QoSProfile(
           durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -384,11 +384,11 @@ class RingDetector(Node):
             label.id = lm.id
             label.type = Marker.TEXT_VIEW_FACING
             label.action = Marker.ADD
-            sphere.pose.position.x = float(lm.position[0])
-            sphere.pose.position.y = float(lm.position[1])
-            sphere.pose.position.z = float(lm.position[2])
+            label.pose.position.x = float(lm.position[0])
+            label.pose.position.y = float(lm.position[1])
+            label.pose.position.z = float(lm.position[2]) + 0.25
             label.pose.orientation.w = 1.0
-            sphere.scale = Vector3(x=0.15, y=0.15, z=0.15)
+            label.scale = Vector3(x=0.0, y=0.0, z=0.15)
             label.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
             label.text = f'Ring {lm.id}'
             marker_array.markers.append(label)
