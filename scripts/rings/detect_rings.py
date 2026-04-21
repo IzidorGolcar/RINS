@@ -3,6 +3,8 @@
 import os
 os.environ.setdefault('QT_LOGGING_RULES', 'default.warning=false;qt.qpa.*=false')
 
+
+from color_segmentation import ObjectDetector
 import rclpy
 from rclpy.node import Node
 import cv2, math
@@ -34,6 +36,7 @@ class RingDetector(Node):
         super().__init__('transform_point')
 
         self.bridge = CvBridge()
+        self.object_detector = ObjectDetector()
 
         self.declare_parameters('', [
             ('rgb_topic',    '/gemini/color/image_raw'),
@@ -137,31 +140,7 @@ class RingDetector(Node):
         roi_pixels = foreground_rgb[roi_mask].reshape((-1, 3)).astype(np.float32)
         return roi_pixels, roi_mask
 
-    def cluster_colors(self, roi_pixels, roi_mask, K=6):
-        (h, w) = roi_mask.shape
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-        _, labels, _ = cv2.kmeans(roi_pixels, K, None, criteria, 8, cv2.KMEANS_RANDOM_CENTERS)
-        labels_reshape = np.zeros((h, w), dtype=np.int32) - 1
-        labels_reshape[roi_mask] = labels.flatten()
-        return labels_reshape
-
-    def build_label_map(self, labels):
-        (h, w) = labels.shape
-        label_map = np.zeros((h, w), dtype=np.uint8)
-        current_id = 1
-
-        K = len(np.unique(labels))
-
-        for cluster_id in range(K):
-            cluster_mask = (labels == cluster_id).astype(np.uint8) * 255
-            num_labels, cc_labels = cv2.connectedComponents(cluster_mask)
-            for i in range(1, num_labels):
-                object_mask = (cc_labels == i)
-                area = np.sum(object_mask)
-                if 50 < area < (h * w * 0.1):
-                    label_map[object_mask] = (current_id * 40) % 255
-                    current_id += 1
-        return label_map
+    
 
     def display_label_map(self, label_map):
         unique_labels = np.unique(label_map)
@@ -194,12 +173,6 @@ class RingDetector(Node):
             cv2.putText(output, label, (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ring_color, 1)
         cv2.imshow('Detections', output)
 
-    def is_grey(self, bgr: tuple[int, int, int], sat_threshold: int = 28) -> bool:
-        pixel = np.uint8([[list(bgr)]])
-        hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0, 0]
-        s, v = int(hsv[1]), int(hsv[2])
-        # Low saturation is grey/white/black. Very dark pixels are also noise.
-        return s <= sat_threshold or v < 30
 
     def _is_hollow(self, img_depth, cx, cy, axes, avg_ring_depth,
                    gap_thresh: float = 0.12) -> bool:
@@ -232,9 +205,6 @@ class RingDetector(Node):
             mask = (label_map == val).astype(np.uint8) * 255
 
             ring_color = self.get_average_color(img_rgb, mask)
-
-            if self.is_grey(ring_color):
-                continue
 
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -397,9 +367,8 @@ class RingDetector(Node):
             self.ring_pub.publish(marker_array)
 
     def detect_rings(self, img_rgb, img_depth):
-        roi_pixels, roi_mask = self.get_roi(img_rgb, img_depth)
-        clusters = self.cluster_colors(roi_pixels, roi_mask)
-        label_map = self.build_label_map(clusters)
+        # roi_pixels, roi_mask = self.get_roi(img_rgb, img_depth)
+        label_map = self.object_detector.get_labels(img_rgb)
         self.display_label_map(label_map)
         rings = self.find_rings(label_map, img_rgb, img_depth)
         self.display_detections(img_rgb, rings)
