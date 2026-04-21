@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
 
 
 class ObjectDetector:
@@ -9,20 +8,30 @@ class ObjectDetector:
         h, w = img.shape[:2]
         lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
         pixels = lab.reshape(-1, 3)
-
         weights = np.array([0.2, 1.0, 1.0], dtype=np.float32)
-
         pixels_f = pixels.astype(np.float32) * weights
-        sample = pixels_f[np.random.randint(0, len(pixels_f),
-                                            size=min(sample_size, len(pixels_f)))]
-        kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42,
-                                 n_init=1, batch_size=4096, max_iter=100)
-        kmeans.fit(sample)
-        labels = kmeans.predict(pixels_f)
-        centers_lab = (kmeans.cluster_centers_ / weights).astype(np.uint8).reshape(1, -1, 3)
+
+        np.random.seed(42)
+        n_pixels = len(pixels_f)
+        if n_pixels > sample_size:
+            indices = np.random.choice(n_pixels, sample_size, replace=False)
+            sample = pixels_f[indices]
+        else:
+            sample = pixels_f
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        flags = cv2.KMEANS_PP_CENTERS
+
+        _, _, centers = cv2.kmeans(sample, n_clusters, None, criteria, 1, flags)
+
+        distances = np.sum((pixels_f[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        labels = np.argmin(distances, axis=1)
+
+        centers_lab = (centers / weights).astype(np.uint8).reshape(1, -1, 3)
         centers_rgb = cv2.cvtColor(
             cv2.cvtColor(centers_lab, cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2RGB
         ).reshape(-1, 3)
+
         return centers_rgb[labels].reshape(h, w, 3)
 
     def _segment_objects(
