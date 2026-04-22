@@ -42,7 +42,7 @@ class RingDetector(Node):
 
     def __init__(self):
         super().__init__('ring_detector_v2')
-
+        self.n = 0
         self.bridge = CvBridge()
         self.object_detector = ObjectDetector()
 
@@ -92,6 +92,7 @@ class RingDetector(Node):
         cv2.namedWindow('Detections', cv2.WINDOW_NORMAL)
         cv2.namedWindow('Segmentation', cv2.WINDOW_NORMAL)
 
+
     def cam_info_callback(self, msg: CameraInfo):
         if self.fx is None:
             self.fx = msg.k[0]
@@ -106,8 +107,11 @@ class RingDetector(Node):
 
     # ---------------- MAIN CALLBACK ----------------
 
+    
     def stream_callback(self, rgb_data: CompressedImage, depth_data: CompressedImage):
-        self.get_logger().info('callback')
+        self.n += 1
+        if self.n % 2 == 0:
+            return
         try:
             cv_image = self.bridge.compressed_imgmsg_to_cv2(rgb_data, 'passthrough')
 
@@ -152,8 +156,7 @@ class RingDetector(Node):
                 interpolation=cv2.INTER_NEAREST,
             )
 
-        # self.detect_rings(cv_image.copy(), depth_image.copy(), rgb_data.header.stamp)
-        cv2.imshow('Detections', cv_image)
+        self.detect_rings(cv_image.copy(), depth_image.copy(), rgb_data.header.stamp)
         cv2.waitKey(1)
 
     # ---------------- GEOMETRY HELPERS ----------------
@@ -401,17 +404,17 @@ class RingDetector(Node):
             downscale_factor=2,
             n_clusters=9,
             sample_size=10_000,
-            min_area=3200,
+            min_area=200,
             morph_kernel_size=5,
-            morph_iterations=2,
+            morph_iterations=1,
         )
         self.display_label_map(label_map)
 
-        # rings = self.find_rings(label_map, img_rgb, img_depth)
-        # self.display_detections(img_rgb, rings)
+        rings = self.find_rings(label_map, img_rgb, img_depth)
+        self.display_detections(img_rgb, rings)
 
-        # close_rings = [ring for ring in rings if ring['depth'] < 2]
-        # self.localize(close_rings, stamp)
+        close_rings = [ring for ring in rings if ring['depth'] < 2]
+        self.localize(close_rings, stamp)
 
 
 def main():
