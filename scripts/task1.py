@@ -23,15 +23,15 @@ from robot_commander import RobotCommander  # noqa: E402
 # Distance between parallel rows (and between points within each row).
 # 1.5 m works well for arenas up to ~10 × 10 m with OAK-D's ~3.5 m range.
 # Increase for faster (but sparser) coverage; decrease for thoroughness.
-COVERAGE_SPACING = 0.65 # meters
+COVERAGE_SPACING = 0.9 # meters
 
 # Sweep axis for the boustrophedon:
 #   'y' – horizontal rows (robot sweeps left-right, rows advance up/down)
 #   'x' – vertical columns (robot sweeps up-down, columns advance left-right)
 # For tall arenas use 'x'; for wide arenas use 'y'.
-SWEEP_AXIS = 'y'
+SWEEP_AXIS = 'x'
 
-ROBOT_CLEARANCE  = 0.1   
+ROBOT_CLEARANCE  = 0.22   
 
 ARENA_X_MIN: float | None =  None
 ARENA_X_MAX: float | None =  None
@@ -40,10 +40,10 @@ ARENA_Y_MAX: float | None =  None
 
 NUM_FACES = 3
 NUM_RINGS = 2
-APPROACH_DIST = 0.25
+APPROACH_DIST = 0.7
 # Max distance (m) at which a detected goal triggers immediate approach.
 # If the goal is farther away, it is deferred until the robot is closer.
-IMMEDIATE_APPROACH_DIST = 1.0
+IMMEDIATE_APPROACH_DIST = 3.0
 GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
 ESPEAK_SPEED = 140      # words per minute

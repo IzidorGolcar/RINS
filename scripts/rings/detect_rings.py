@@ -11,7 +11,7 @@ import cv2, math
 import numpy as np
 import tf2_ros
 
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import PointStamped, Vector3, Pose
 from cv_bridge import CvBridge, CvBridgeError
 from visualization_msgs.msg import Marker, MarkerArray
@@ -39,8 +39,8 @@ class RingDetector(Node):
         self.object_detector = ObjectDetector()
 
         self.declare_parameters('', [
-            ('rgb_topic',   '/gemini/color/image_raw/compressed'),
-            ('depth_topic', '/gemini/depth/image_raw/compressedDepth'),
+            ('rgb_topic',    '/gemini/color/image_raw'),
+            ('depth_topic',  '/gemini/depth/image_raw'),
             ('camera_frame', 'gemini_color_frame'),
         ])
         self._rgb_topic    = self.get_parameter('rgb_topic').get_parameter_value().string_value
@@ -48,17 +48,16 @@ class RingDetector(Node):
         self._camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
 
         self.rgb_sub = message_filters.Subscriber(
-            self, CompressedImage, self._rgb_topic,
+            self, Image, self._rgb_topic,
             qos_profile=qos_profile_sensor_data)
         self.depth_sub = message_filters.Subscriber(
-            self, CompressedImage, self._depth_topic,
+            self, Image, self._depth_topic,
             qos_profile=qos_profile_sensor_data)
 
         self.stream = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
-            queue_size=5,
-            slop=0.5,
-            allow_headerless=True
+            queue_size=3,
+            slop=0.2
         )
 
         self.stream.registerCallback(self.stream_callback)
@@ -72,7 +71,8 @@ class RingDetector(Node):
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
         cam_info_topic = self._rgb_topic.rsplit('/', 1)[0] + '/camera_info'
-        
+        # Subscribe with BOTH QoS profiles — camera_info publisher can be
+        # either RELIABLE or BEST_EFFORT depending on the driver build.
         self.cam_info_sub_reliable = self.create_subscription(
             CameraInfo, cam_info_topic, self.cam_info_callback, 10)
         self.cam_info_sub_sensor = self.create_subscription(
@@ -99,20 +99,26 @@ class RingDetector(Node):
 
     def stream_callback(self, rgb_data, depth_data):
         try:
-            cv_image  = self.bridge.compressed_imgmsg_to_cv2(rgb_data, desired_encoding='passthrough')
+            cv_image  = self.bridge.imgmsg_to_cv2(rgb_data, 'bgr8')
+            raw_depth = self.bridge.imgmsg_to_cv2(depth_data, desired_encoding='passthrough')
+            if raw_depth.dtype == np.uint16:
+                depth_image = raw_depth.astype(np.float32) / 1000.0
+            else:
+                depth_image = raw_depth.astype(np.float32)
         except Exception as e:
             self.get_logger().error(f'{e}')
             return
 
         if not self.received_camera_info:
+            # Still show the raw feed so the user can see the stream is alive.
             cv2.imshow('Detections', cv_image)
             cv2.waitKey(1)
             self.get_logger().warn(
-                'Waiting for camera_info',
+                'Waiting for camera_info – ring localization disabled.',
                 throttle_duration_sec=5.0)
             return
 
-        self.detect_rings(cv_image, None)
+        self.detect_rings(cv_image.copy(), depth_image.copy())
         cv2.waitKey(1)
 
     def estimate_height_from_ground(self, cy, avg_depth, img_h):
@@ -135,6 +141,7 @@ class RingDetector(Node):
         return roi_pixels, roi_mask
 
     
+
     def display_label_map(self, label_map):
         unique_labels = np.unique(label_map)
         areas = {label: np.sum(label_map == label) for label in unique_labels if label != 0}
@@ -165,6 +172,7 @@ class RingDetector(Node):
             label = f"RING"
             cv2.putText(output, label, (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ring_color, 1)
         cv2.imshow('Detections', output)
+
 
     def _is_hollow(self, img_depth, cx, cy, axes, avg_ring_depth,
                    gap_thresh: float = 0.12) -> bool:
@@ -312,6 +320,7 @@ class RingDetector(Node):
 
         self._publish_confirmed()
 
+
     def _publish_confirmed(self):
         confirmed = self.ring_map.confirmed_landmarks()
         
@@ -359,22 +368,16 @@ class RingDetector(Node):
 
     def detect_rings(self, img_rgb, img_depth):
         # roi_pixels, roi_mask = self.get_roi(img_rgb, img_depth)
-        label_map = self.object_detector.get_labels(
-            img_rgb, 
-            downscale_factor=2,
-            n_clusters=5,
-            sample_size=10_000,
-            min_area=3200,
-            morph_kernel_size=5,
-            morph_iterations=2,
-        )
+        label_map = self.object_detector.get_labels(img_rgb)
         self.display_label_map(label_map)
-        # rings = self.find_rings(label_map, img_rgb, img_depth)
-        # self.display_detections(img_rgb, rings)
+        rings = self.find_rings(label_map, img_rgb, img_depth)
+        self.display_detections(img_rgb, rings)
 
-        # close_rings = [ring for ring in rings if ring['depth'] < 2]
+        close_rings = [ring for ring in rings if ring['depth'] < 2]
 
-        # self.localize(close_rings)
+        self.localize(close_rings)
+
+        
 
 
 def main():

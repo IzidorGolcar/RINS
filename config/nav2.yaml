@@ -84,11 +84,11 @@ local_costmap:
                   [-0.134,  0.134],
                   [ 0.000,  0.189],
                   [ 0.134,  0.134]]"
-      plugins: ["static_layer", "voxel_layer", "inflation_layer"]
-      inflation_layer:
-        plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+      plugins: ["static_layer", "voxel_layer"]
+      # inflation_layer:
+      #   plugin: "nav2_costmap_2d::InflationLayer"
+      #   cost_scaling_factor: 20.0
+      #   inflation_radius: 0.03
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -132,7 +132,7 @@ global_costmap:
                   [ 0.134,  0.134]]"
       resolution: 0.06
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -150,10 +150,10 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
-      inflation_layer:
-        plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+      # inflation_layer:
+      #   plugin: "nav2_costmap_2d::InflationLayer"
+      #   cost_scaling_factor: 20.0
+      #   inflation_radius: 0.03
       always_send_full_costmap: true
 
 planner_server:
