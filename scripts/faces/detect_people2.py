@@ -12,7 +12,9 @@ from rclpy.time import Time
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
+                       QoSProfile, QoSReliabilityPolicy,
+                       qos_profile_sensor_data)
 from sensor_msgs.msg import CameraInfo, Image, CompressedImage
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -25,13 +27,22 @@ class FaceDetector(Node):
     MIN_DIST = 0.5
     MAX_DIST = 3.5
     FACE_MIN_SEPARATION = 0.8
-    BLAZE_CONFIDENCE = 0.3
+    BLAZE_CONFIDENCE = 0.4
     MODEL_FILENAME = 'face_detection_short_range_with_metadata.tflite'
     CONFIRM_HITS = 2
     CANDIDATE_RADIUS = 0.4
-    DEPTH_SAMPLE_RADIUS = 4
+    DEPTH_SAMPLE_RADIUS = 6      # larger patch survives depth holes
+    DEPTH_STD_MAX = 0.35         # tolerate noisier real-robot depth
     CANDIDATE_TIMEOUT_SEC = 2.5
     TARGET_FRAME = 'map'
+    MARKER_QOS = QoSProfile(
+        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=10)
+    FRAME_SKIP = 1               # process every Nth frame (1 = all)
+    INFER_SCALE = 3              # downsample for MediaPipe (3x = 9x speedup)
+    USE_HAAR_FILTER = True       # run Haar on each MP bbox to cull wall/poster FPs
 
     def __init__(self):
         super().__init__('face_detector')
@@ -40,6 +51,7 @@ class FaceDetector(Node):
         self.candidates = []
         self.confirmed_faces = []
         self._next_face_id = 0
+        self._frame_count = 0
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -86,7 +98,7 @@ class FaceDetector(Node):
         self.ts.registerCallback(self.synced_callback)
 
         self.marker_pub = self.create_publisher(
-            MarkerArray, '/people_markers', QoSReliabilityPolicy.BEST_EFFORT)
+            MarkerArray, '/people_markers', self.MARKER_QOS)
 
         self.get_logger().info("Face detector initialized")
 
@@ -114,54 +126,51 @@ class FaceDetector(Node):
     # ---------------- MAIN CALLBACK ----------------
 
     def synced_callback(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
+        # Drop every other frame (or more) when FRAME_SKIP > 1 to keep latency low.
+        self._frame_count += 1
+        if self._frame_count % self.FRAME_SKIP != 0:
+            return
 
+        # Decode JPEG directly — avoids cv_bridge's cvtColor2 quirks on Jazzy.
         try:
-            cv_image = self.bridge.compressed_imgmsg_to_cv2(rgb_msg, 'passthrough')
+            rgb_payload = np.frombuffer(rgb_msg.data, dtype=np.uint8)
+            cv_image = cv2.imdecode(rgb_payload, cv2.IMREAD_COLOR)
 
-            # compressedDepth = 12-byte ConfigHeader + PNG payload; strip header, PNG-decode.
             depth_payload = np.frombuffer(bytes(depth_msg.data)[12:], dtype=np.uint8)
             raw_depth = cv2.imdecode(depth_payload, cv2.IMREAD_UNCHANGED)
-
-            # ✅ SAFE CHECKS (FIXED CRASH ROOT CAUSE)
-            if cv_image is None or raw_depth is None:
-                self.get_logger().warn("Received a null RGB or depth frame")
-                return
-
-            if cv_image.size == 0 or raw_depth.size == 0:
-                self.get_logger().warn("Received an empty RGB or depth frame")
-                return
-
-            if cv_image.ndim != 3 or cv_image.shape[2] != 3:
-                self.get_logger().warn(
-                    f"Unexpected RGB frame shape {cv_image.shape}")
-                return
-
-            if cv_image.shape[0] < 10 or cv_image.shape[1] < 10:
-                self.get_logger().warn("Empty RGB frame")
-                return
-
-            if raw_depth.dtype == np.uint16:
-                depth_image = raw_depth.astype(np.float32) / 1000.0
-            else:
-                depth_image = raw_depth.astype(np.float32)
-
-            if depth_image.size == 0:
-                self.get_logger().warn("Empty depth frame")
-                return
-
         except Exception as e:
-            self.get_logger().error(f"CV error: {e}")
+            self.get_logger().error(f'Frame decode failed: {e}')
             return
+
+        if cv_image is None or raw_depth is None:
+            return
+        if cv_image.size == 0 or raw_depth.size == 0:
+            return
+        if cv_image.ndim != 3 or cv_image.shape[2] != 3:
+            self.get_logger().warn(f'Unexpected RGB shape {cv_image.shape}')
+            return
+
+        depth_image = (raw_depth.astype(np.float32) / 1000.0
+                       if raw_depth.dtype == np.uint16
+                       else raw_depth.astype(np.float32))
 
         if self.fx is None:
             return
 
         vis = cv_image.copy()
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY) if self.USE_HAAR_FILTER else None
 
-        # Downsample for MediaPipe inference (~4x CPU speedup); scale bbox coords back.
-        INFER_SCALE = 2
-        proc = cv2.resize(cv_image, None,
-                          fx=1.0 / INFER_SCALE, fy=1.0 / INFER_SCALE,
+        # Align depth → RGB resolution once if drivers publish mismatched sizes.
+        if depth_image.shape[:2] != cv_image.shape[:2]:
+            depth_image = cv2.resize(
+                depth_image,
+                (cv_image.shape[1], cv_image.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        # Downsample + BGR→RGB in one step for MediaPipe.
+        s = self.INFER_SCALE
+        proc = cv2.resize(cv_image, None, fx=1.0 / s, fy=1.0 / s,
                           interpolation=cv2.INTER_AREA)
         proc = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
 
@@ -171,34 +180,56 @@ class FaceDetector(Node):
 
         new_positions = []
         for detection in detections:
-
             bbox = detection.bounding_box
-            x1 = max(0, int(bbox.origin_x * INFER_SCALE))
-            y1 = max(0, int(bbox.origin_y * INFER_SCALE))
-            x2 = min(cv_image.shape[1], int((bbox.origin_x + bbox.width) * INFER_SCALE))
-            y2 = min(cv_image.shape[0], int((bbox.origin_y + bbox.height) * INFER_SCALE))
-
+            x1 = max(0, int(bbox.origin_x * s))
+            y1 = max(0, int(bbox.origin_y * s))
+            x2 = min(cv_image.shape[1], int((bbox.origin_x + bbox.width) * s))
+            y2 = min(cv_image.shape[0], int((bbox.origin_y + bbox.height) * s))
             if x2 <= x1 or y2 <= y1:
                 continue
 
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
 
+            # Haar secondary filter — rejects posters, wall textures, stickers
+            # that MediaPipe sometimes hits on at low confidence.
+            if self.USE_HAAR_FILTER:
+                roi = gray[y1:y2, x1:x2]
+                if not self._haar_has_face(roi):
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 180), 1)
+                    continue
+
+            # Multi-point depth sampling: median of 5 patches (centre + 4 off-centre)
+            # is much more robust than a single patch that may land on a depth hole.
             r = self.DEPTH_SAMPLE_RADIUS
-            z_patch = depth_image[max(0, cy-r):cy+r, max(0, cx-r):cx+r]
-            valid = z_patch[np.isfinite(z_patch) & (z_patch > 0)]
-
-            # Require enough depth samples, and reject "holes" with noisy depth.
-            if valid.size < 8:
+            face_w = x2 - x1
+            face_h = y2 - y1
+            probe_offsets = [
+                (0, 0),
+                (-face_w // 4, 0), (face_w // 4, 0),
+                (0, -face_h // 4), (0, face_h // 4),
+            ]
+            samples = []
+            for dx, dy in probe_offsets:
+                px, py = cx + dx, cy + dy
+                patch = depth_image[max(0, py - r):py + r + 1,
+                                    max(0, px - r):px + r + 1]
+                valid = patch[np.isfinite(patch) & (patch > 0)]
+                if valid.size >= 3:
+                    samples.append(float(np.median(valid)))
+            if len(samples) < 2:
                 continue
-            if float(np.std(valid)) > 0.25:
-                continue
 
-            z = float(np.median(valid))
+            samples_arr = np.array(samples)
+            if float(np.std(samples_arr)) > self.DEPTH_STD_MAX:
+                continue
+            z = float(np.median(samples_arr))
             if not (self.MIN_DIST <= z <= self.MAX_DIST):
                 continue
 
             cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(vis, f'{z:.2f}m', (x1, max(y1 - 6, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
             pos_map = self._project_to_map(cx, cy, z, rgb_msg.header.stamp)
             if pos_map is not None:
@@ -213,6 +244,19 @@ class FaceDetector(Node):
         cv2.imshow("Face Detection", vis)
         cv2.waitKey(1)
 
+    def _haar_has_face(self, gray_roi):
+        """Return True if either Haar cascade finds a face in the ROI."""
+        if gray_roi is None or gray_roi.size == 0:
+            return False
+        h, w = gray_roi.shape[:2]
+        if h < 16 or w < 16:
+            # ROI too small for Haar to evaluate — trust MediaPipe.
+            return True
+        kwargs = dict(scaleFactor=1.1, minNeighbors=1, minSize=(12, 12))
+        if len(self.face_cascade.detectMultiScale(gray_roi, **kwargs)) > 0:
+            return True
+        return len(self.face_cascade_alt2.detectMultiScale(gray_roi, **kwargs)) > 0
+
     # ---------------- TRACKING / PUBLISHING ----------------
 
     def _project_to_map(self, cx, cy, z, stamp):
@@ -221,31 +265,36 @@ class FaceDetector(Node):
 
         pt = PointStamped()
         pt.header.frame_id = self._camera_frame
-        # Use the RGB frame's capture time so tf2 interpolates to that moment —
-        # critical when the robot is rotating and the camera feed stutters.
         pt.header.stamp = stamp
         pt.point.x = float(z)
         pt.point.y = float(-X_cam_opt)
         pt.point.z = float(-Y_cam_opt)
 
         stamp_time = Time.from_msg(stamp)
-        if not self.tf_buffer.can_transform(
+        # Try frame-time TF first (accurate when robot is rotating); fall back
+        # to the latest TF so we don't pause localization whenever the camera
+        # stamp drifts past the TF buffer's end.
+        if self.tf_buffer.can_transform(
                 self.TARGET_FRAME, self._camera_frame, stamp_time,
-                timeout=rclpy.duration.Duration(seconds=0.1)):
-            self.get_logger().warn(
-                f'TF {self._camera_frame}->{self.TARGET_FRAME} not ready at '
-                'frame time; face localization paused.',
-                throttle_duration_sec=5.0)
-            return None
+                timeout=rclpy.duration.Duration(seconds=0.05)):
+            try:
+                pt_map = self.tf_buffer.transform(
+                    pt, self.TARGET_FRAME,
+                    timeout=rclpy.duration.Duration(seconds=0.05))
+                return np.array([pt_map.point.x, pt_map.point.y, pt_map.point.z])
+            except Exception:
+                pass
+
+        pt.header.stamp = Time().to_msg()
         try:
             pt_map = self.tf_buffer.transform(
                 pt, self.TARGET_FRAME,
                 timeout=rclpy.duration.Duration(seconds=0.1))
         except Exception as e:
             self.get_logger().warn(
-                f'TF transform failed: {e}', throttle_duration_sec=5.0)
+                f'TF transform failed (both stamp and latest): {e}',
+                throttle_duration_sec=5.0)
             return None
-
         return np.array([pt_map.point.x, pt_map.point.y, pt_map.point.z])
 
     def _update_tracks(self, positions):
@@ -315,7 +364,7 @@ class FaceDetector(Node):
             m = Marker()
             m.header.frame_id = self.TARGET_FRAME
             m.header.stamp = now
-            m.ns = 'confirmed_faces'
+            m.ns = 'faces'
             m.id = face['id']
             m.type = Marker.SPHERE
             m.action = Marker.ADD

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import math
-import subprocess
 import sys
 import time
 from collections import deque
@@ -11,9 +10,10 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import String
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                         QoSProfile, QoSReliabilityPolicy)
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import Marker, MarkerArray
 
 import os
 sys.path.insert(0, os.path.dirname(__file__))
@@ -39,11 +39,11 @@ ARENA_Y_MIN: float | None =  None
 ARENA_Y_MAX: float | None =  None
 
 NUM_FACES = 3
-NUM_RINGS = 2
+NUM_RINGS = 0
 APPROACH_DIST = 0.25
-# Max distance (m) at which a detected goal triggers immediate approach.
-# If the goal is farther away, it is deferred until the robot is closer.
-IMMEDIATE_APPROACH_DIST = 1.0
+NAV_WAIT_TIMEOUT_SEC = 8.0
+FACE_MIN_HEIGHT_M = 0.0
+FACE_MAX_HEIGHT_M = 0.5
 GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
 ESPEAK_SPEED = 140      # words per minute
@@ -94,6 +94,12 @@ _MAP_QOS = QoSProfile(
     history=QoSHistoryPolicy.KEEP_LAST,
     depth=1)
 
+_MARKER_QOS = QoSProfile(
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=10)
+
 class State(Enum):
     SEARCHING   = auto()
     APPROACHING = auto()
@@ -131,10 +137,15 @@ class Task1Node(RobotCommander):
             OccupancyGrid, '/map', self._map_cb, _MAP_QOS)
 
         self.create_subscription(
-            MarkerArray, '/people_markers', self._people_marker_cb, 10)
+            MarkerArray, '/people_markers', self._people_marker_cb, _MARKER_QOS)
 
         self.create_subscription(
-            MarkerArray, '/ring_markers', self._ring_marker_cb, 10)
+            MarkerArray, '/ring_markers', self._ring_marker_cb, _MARKER_QOS)
+
+        self.waypoint_marker_pub = self.create_publisher(
+            MarkerArray, '/coverage_waypoints', 10)
+        self.speak_pub = self.create_publisher(String, '/speak', 10)
+        self.create_timer(1.0, self._publish_waypoint_markers)
 
         self.info('Task1 node ready – waiting for map and Nav2.')
 
@@ -248,13 +259,86 @@ class Task1Node(RobotCommander):
         return result
 
 
+    def _publish_waypoint_markers(self) -> None:
+        if not self.coverage_waypoints:
+            return
+        now = self.get_clock().now().to_msg()
+        ma = MarkerArray()
+        for i, (wx, wy, yaw_deg) in enumerate(self.coverage_waypoints):
+            visited = i < self.waypoint_idx
+            current = i == self.waypoint_idx
+
+            sphere = Marker()
+            sphere.header.frame_id = 'map'
+            sphere.header.stamp = now
+            sphere.ns = 'waypoints'
+            sphere.id = i
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = float(wx)
+            sphere.pose.position.y = float(wy)
+            sphere.pose.position.z = 0.05
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.12
+            if current:
+                sphere.color.r, sphere.color.g, sphere.color.b = 1.0, 1.0, 0.0
+            elif visited:
+                sphere.color.r, sphere.color.g, sphere.color.b = 0.3, 0.3, 0.3
+            else:
+                sphere.color.r, sphere.color.g, sphere.color.b = 0.0, 0.6, 1.0
+            sphere.color.a = 0.9
+            ma.markers.append(sphere)
+
+            arrow = Marker()
+            arrow.header.frame_id = 'map'
+            arrow.header.stamp = now
+            arrow.ns = 'waypoint_yaw'
+            arrow.id = i
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.position.x = float(wx)
+            arrow.pose.position.y = float(wy)
+            arrow.pose.position.z = 0.05
+            arrow.pose.orientation = self.YawToQuaternion(math.radians(yaw_deg))
+            arrow.scale.x = 0.25
+            arrow.scale.y = 0.04
+            arrow.scale.z = 0.04
+            arrow.color.r, arrow.color.g, arrow.color.b, arrow.color.a = 0.0, 0.8, 0.2, 0.8
+            ma.markers.append(arrow)
+
+            label = Marker()
+            label.header.frame_id = 'map'
+            label.header.stamp = now
+            label.ns = 'waypoint_labels'
+            label.id = i
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = float(wx)
+            label.pose.position.y = float(wy)
+            label.pose.position.z = 0.25
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.15
+            label.color.r = label.color.g = label.color.b = 1.0
+            label.color.a = 1.0
+            label.text = str(i + 1)
+            ma.markers.append(label)
+
+        self.waypoint_marker_pub.publish(ma)
+
     def _people_marker_cb(self, msg: MarkerArray) -> None:
+        if NUM_FACES <= 0:
+            return
         for m in msg.markers:
             if m.ns == 'faces':
                 fid = m.id
                 if fid in self.known_faces:
                     continue
                 pos = (m.pose.position.x, m.pose.position.y, m.pose.position.z)
+                if not (FACE_MIN_HEIGHT_M <= pos[2] <= FACE_MAX_HEIGHT_M):
+                    self.info(
+                        f'Ignoring face #{fid}: height {pos[2]:.2f} m out of range '
+                        f'[{FACE_MIN_HEIGHT_M:.2f}, {FACE_MAX_HEIGHT_M:.2f}] m.')
+                    continue
                 self.known_faces[fid] = pos
                 if fid not in self.greeted_ids:
                     self.to_greet.append(fid)
@@ -264,6 +348,8 @@ class Task1Node(RobotCommander):
 
 
     def _ring_marker_cb(self, msg: MarkerArray) -> None:
+        if NUM_RINGS <= 0:
+            return
         for m in msg.markers:
             if m.ns == 'confirmed_rings':
                 rid = m.id
@@ -287,59 +373,97 @@ class Task1Node(RobotCommander):
 
 
     def _has_nearby_goal(self) -> bool:
-        """Return True if any queued face/ring is within IMMEDIATE_APPROACH_DIST."""
-        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
-            return bool(self.to_greet or self.to_greet_rings)
-        rx = self.current_pose.pose.position.x
-        ry = self.current_pose.pose.position.y
-        for fid in self.to_greet:
-            fx, fy, _ = self.known_faces[fid]
-            if math.hypot(fx - rx, fy - ry) <= IMMEDIATE_APPROACH_DIST:
-                return True
-        for rid in self.to_greet_rings:
-            rx2, ry2, _ = self.known_rings[rid]
-            if math.hypot(rx2 - rx, ry2 - ry) <= IMMEDIATE_APPROACH_DIST:
-                return True
-        return False
+        """Return True if any confirmed goal should interrupt navigation."""
+        return bool((NUM_FACES > 0 and self.to_greet)
+                    or (NUM_RINGS > 0 and self.to_greet_rings))
 
     def _pop_nearest_goal(self) -> tuple[str, int]:
         """Pop and return ('face', id) or ('ring', id) for the nearest queued goal."""
+        if self.current_face_id is not None:
+            return ('face', self.current_face_id)
+        if self.current_ring_id is not None:
+            return ('ring', self.current_ring_id)
         if not (hasattr(self, 'current_pose') and self.current_pose is not None):
-            if self.to_greet:
+            if NUM_FACES > 0 and self.to_greet:
                 return ('face', self.to_greet.popleft())
+            if NUM_FACES <= 0 and NUM_RINGS <= 0:
+                raise RuntimeError('No goals queued and both faces/rings are disabled.')
+            if NUM_RINGS <= 0:
+                raise RuntimeError('No face goals queued and rings are disabled.')
             return ('ring', self.to_greet_rings.popleft())
         rx = self.current_pose.pose.position.x
         ry = self.current_pose.pose.position.y
         best_dist = float('inf')
         best_type = 'face'
         best_id = -1
-        for fid in self.to_greet:
-            fx, fy, _ = self.known_faces[fid]
-            d = math.hypot(fx - rx, fy - ry)
-            if d < best_dist:
-                best_dist, best_type, best_id = d, 'face', fid
-        for rid in self.to_greet_rings:
-            rx2, ry2, _ = self.known_rings[rid]
-            d = math.hypot(rx2 - rx, ry2 - ry)
-            if d < best_dist:
-                best_dist, best_type, best_id = d, 'ring', rid
+        if NUM_FACES > 0:
+            for fid in self.to_greet:
+                fx, fy, _ = self.known_faces[fid]
+                d = math.hypot(fx - rx, fy - ry)
+                if d < best_dist:
+                    best_dist, best_type, best_id = d, 'face', fid
+        if NUM_RINGS > 0:
+            for rid in self.to_greet_rings:
+                rx2, ry2, _ = self.known_rings[rid]
+                d = math.hypot(rx2 - rx, ry2 - ry)
+                if d < best_dist:
+                    best_dist, best_type, best_id = d, 'ring', rid
+        if best_id < 0:
+            raise RuntimeError('No eligible goal found for current task settings.')
         if best_type == 'face':
             self.to_greet.remove(best_id)
         else:
             self.to_greet_rings.remove(best_id)
         return (best_type, best_id)
 
-    def _spin_ros(self, timeout: float = 0.1) -> None:
+    def _look_at_face(self, face_id: int) -> None:
+        """Rotate in place to face the detected face before greeting."""
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            return
+
+        fx, fy, _ = self.known_faces[face_id]
+        cx = self.current_pose.pose.position.x
+        cy = self.current_pose.pose.position.y
+        target_yaw = math.atan2(fy - cy, fx - cx)
+
+        q = self.current_pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        delta_yaw = math.atan2(
+            math.sin(target_yaw - current_yaw),
+            math.cos(target_yaw - current_yaw),
+        )
+
+        if abs(delta_yaw) > 0.05:
+            spin_time = max(3, int(abs(delta_yaw) / 0.8) + 2)
+            self.spin(spin_dist=delta_yaw, time_allowance=spin_time)
+            self._wait_nav(allow_interrupt=False)
+
+        end_time = time.time() + 0.7
+        while time.time() < end_time:
+            self._spin_ros(timeout=0.05)
+
+    def _spin_ros(self, timeout: float = 0.05) -> None:
         rclpy.spin_once(self, timeout_sec=timeout)
 
     def _wait_nav(self, allow_interrupt: bool = True) -> bool:
         """Spin until current Nav2 goal finishes.
         """
+        start_time = time.time()
         while not self.isTaskComplete():
             self._spin_ros()
             if allow_interrupt and self._has_nearby_goal():
                 self.cancelTask()
                 self.info('Navigation cancelled – new target queued.')
+                return False
+
+            if (time.time() - start_time) >= NAV_WAIT_TIMEOUT_SEC:
+                self.cancelTask()
+                self.warn(
+                    f'Navigation timed out after {NAV_WAIT_TIMEOUT_SEC:.1f}s; '
+                    'task cancelled.')
                 return False
 
         # Check the actual result status – treat anything other than SUCCEEDED as failure
@@ -429,10 +553,9 @@ class Task1Node(RobotCommander):
 
     def _say(self, text: str) -> None:
         self.info(f'Speaking: "{text}"')
-        subprocess.Popen(
-            ['espeak', '-s', str(ESPEAK_SPEED), text],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        msg = String()
+        msg.data = text
+        self.speak_pub.publish(msg)
         words = len(text.split())
         wait_sec = (words / ESPEAK_SPEED) * 60.0 + 1.5
         end_time = time.time() + wait_sec
@@ -463,6 +586,7 @@ class Task1Node(RobotCommander):
 
         self.info(
             f'Starting search over {len(self.coverage_waypoints)} waypoints.')
+        self._say("Let's do the job")
 
         while rclpy.ok():
 
@@ -470,7 +594,7 @@ class Task1Node(RobotCommander):
                 self.info(
                     f'All {NUM_FACES} faces and {NUM_RINGS} rings greeted. '
                     f'Task complete!')
-                self._say("I'm done! That was easy!")
+                self._say("I'm done, that was easy")
                 break
 
             elif self.state == State.SEARCHING:
@@ -481,7 +605,8 @@ class Task1Node(RobotCommander):
 
                 if self.waypoint_idx >= len(self.coverage_waypoints):
                     # Path done — approach any deferred goals before restarting
-                    if self.to_greet or self.to_greet_rings:
+                    if ((NUM_FACES > 0 and self.to_greet)
+                            or (NUM_RINGS > 0 and self.to_greet_rings)):
                         self.state = State.APPROACHING
                         continue
                     faces_done = len(self.greeted_ids) >= NUM_FACES
@@ -506,6 +631,7 @@ class Task1Node(RobotCommander):
 
                 if not self._wait_nav(allow_interrupt=True):
                     if self._has_nearby_goal():
+                        self.waypoint_idx += 1
                         self.waypoint_fail_count = 0
                         self.state = State.APPROACHING
                     else:
@@ -524,32 +650,45 @@ class Task1Node(RobotCommander):
 
             elif self.state == State.APPROACHING:
 
-                if not (self.to_greet or self.to_greet_rings):
+                if self.current_face_id is None and self.current_ring_id is None:
+                    if not ((NUM_FACES > 0 and self.to_greet)
+                            or (NUM_RINGS > 0 and self.to_greet_rings)):
+                        self.state = State.SEARCHING
+                        continue
+
+                    goal_type, goal_id = self._pop_nearest_goal()
+
+                    if goal_type == 'face':
+                        if goal_id in self.greeted_ids:
+                            continue
+                        self.current_face_id = goal_id
+                        self.current_ring_id = None
+                        fx, fy, _ = self.known_faces[goal_id]
+                        self.info(
+                            f'Approaching face #{goal_id} at ({fx:.2f}, {fy:.2f}).')
+                        self.goToPose(self._approach_pose(goal_id))
+                    else:
+                        if goal_id in self.greeted_ring_ids:
+                            continue
+                        self.current_ring_id = goal_id
+                        self.current_face_id = None
+                        rx2, ry2, _ = self.known_rings[goal_id]
+                        color_name = _bgr_to_color_name(self.ring_colors[goal_id])
+                        self.info(
+                            f'Approaching {color_name} ring #{goal_id} '
+                            f'at ({rx2:.2f}, {ry2:.2f}).')
+                        self.goToPose(self._approach_pose_ring(goal_id))
+
+                if self.current_face_id is None and self.current_ring_id is None:
                     self.state = State.SEARCHING
                     continue
 
-                goal_type, goal_id = self._pop_nearest_goal()
-
-                if goal_type == 'face':
-                    if goal_id in self.greeted_ids:
-                        continue
-                    self.current_face_id = goal_id
-                    self.current_ring_id = None
-                    fx, fy, _ = self.known_faces[goal_id]
-                    self.info(
-                        f'Approaching face #{goal_id} at ({fx:.2f}, {fy:.2f}).')
-                    self.goToPose(self._approach_pose(goal_id))
+                if self.current_face_id is not None:
+                    goal_type = 'face'
+                    goal_id = self.current_face_id
                 else:
-                    if goal_id in self.greeted_ring_ids:
-                        continue
-                    self.current_ring_id = goal_id
-                    self.current_face_id = None
-                    rx2, ry2, _ = self.known_rings[goal_id]
-                    color_name = _bgr_to_color_name(self.ring_colors[goal_id])
-                    self.info(
-                        f'Approaching {color_name} ring #{goal_id} '
-                        f'at ({rx2:.2f}, {ry2:.2f}).')
-                    self.goToPose(self._approach_pose_ring(goal_id))
+                    goal_type = 'ring'
+                    goal_id = self.current_ring_id
 
                 completed = self._wait_nav(allow_interrupt=False)
                 if completed:
@@ -582,8 +721,10 @@ class Task1Node(RobotCommander):
 
                 if self.current_face_id is not None:
                     face_id = self.current_face_id
+                    self._look_at_face(face_id)
                     self._greet()
                     self.greeted_ids.add(face_id)
+                    self.current_face_id = None
                     self.info(
                         f'Greeted face #{face_id}.  '
                         f'Total faces: {len(self.greeted_ids)}/{NUM_FACES}.')
@@ -594,6 +735,7 @@ class Task1Node(RobotCommander):
                     text = RING_GREETING_TEMPLATE.format(color=color_name)
                     self._say(text)
                     self.greeted_ring_ids.add(ring_id)
+                    self.current_ring_id = None
                     self.info(
                         f'Greeted {color_name} ring #{ring_id}.  '
                         f'Total rings: {len(self.greeted_ring_ids)}/{NUM_RINGS}.')

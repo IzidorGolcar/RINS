@@ -7,7 +7,14 @@ from launch.substitutions import PathJoinSubstitution
 
 def generate_launch_description():
 
-    # Localization launch
+    dis_nav2_params = PathJoinSubstitution([
+        FindPackageShare('dis_tutorial3'), 'config', 'nav2.yaml'
+    ])
+
+    # Localization launch — keep TurtleBot4's default localization.yaml
+    # (our config/localization.yaml uses scan_filtered, which would require
+    # the laser_filter_chain to be running and would break 2D Pose Estimate
+    # in RViz without it).
     localization_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -17,7 +24,7 @@ def generate_launch_description():
             ])
         ),
         launch_arguments={
-            'map': 'src/RINS/maps/task1r.yaml'
+            'map': 'src/RINS/maps/task1r.yaml',
         }.items()
     )
 
@@ -29,7 +36,10 @@ def generate_launch_description():
                 'launch',
                 'nav2.launch.py'
             ])
-        )
+        ),
+        launch_arguments={
+            'params_file': dis_nav2_params,
+        }.items()
     )
 
     # Visualization launch
