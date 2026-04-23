@@ -1,10 +1,5 @@
 #!/usr/bin/python3
 
-import os
-os.environ.setdefault('QT_LOGGING_RULES', 'default.warning=false;qt.qpa.*=false')
-
-
-from color_segmentation import ObjectDetector
 import rclpy
 from rclpy.node import Node
 import cv2, math
@@ -25,38 +20,26 @@ import tf2_geometry_msgs
 from sensor_msgs.msg import CameraInfo
 from ring_map import *
 
-qos_profile = QoSProfile(
-          durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-          reliability=QoSReliabilityPolicy.RELIABLE,
-          history=QoSHistoryPolicy.KEEP_LAST,
-          depth=1)
 
 class RingDetector(Node):
+
+    MARKER_QOS = QoSProfile(
+        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=10)
+
     def __init__(self):
         super().__init__('transform_point')
 
         self.bridge = CvBridge()
-        self.object_detector = ObjectDetector()
 
-        self.declare_parameters('', [
-            ('rgb_topic',   '/gemini/color/image_raw/compressed'),
-            ('depth_topic', '/gemini/depth/image_raw/compressedDepth'),
-            ('camera_frame', 'gemini_color_frame'),
-        ])
-        self._rgb_topic    = self.get_parameter('rgb_topic').get_parameter_value().string_value
-        self._depth_topic  = self.get_parameter('depth_topic').get_parameter_value().string_value
-        self._camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
-
-        self.rgb_sub = message_filters.Subscriber(
-            self, CompressedImage, self._rgb_topic,
-            qos_profile=qos_profile_sensor_data)
-        self.depth_sub = message_filters.Subscriber(
-            self, CompressedImage, self._depth_topic,
-            qos_profile=qos_profile_sensor_data)
+        self.rgb_sub = message_filters.Subscriber(self, CompressedImage, '/gemini/color/image_raw/compressed')
+        self.depth_sub = message_filters.Subscriber(self, CompressedImage, '/gemini/depth/image_raw/compressedDepth')
 
         self.stream = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
-            queue_size=5,
+            queue_size=20,
             slop=0.5,
             allow_headerless=True
         )
@@ -65,22 +48,23 @@ class RingDetector(Node):
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.ring_pub = self.create_publisher(MarkerArray, '/ring_markers', qos_profile)
+        self.ring_pub = self.create_publisher(MarkerArray, '/ring_markers', self.MARKER_QOS)
         self.marker_id = 0
 
         self.received_camera_info = False
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
-        cam_info_topic = self._rgb_topic.rsplit('/', 1)[0] + '/camera_info'
         
-        self.cam_info_sub_reliable = self.create_subscription(
-            CameraInfo, cam_info_topic, self.cam_info_callback, 10)
-        self.cam_info_sub_sensor = self.create_subscription(
-            CameraInfo, cam_info_topic, self.cam_info_callback,
-            qos_profile_sensor_data)
+        
+        camera_info_topic = '/gemini/color/camera_info'
+        self.create_subscription(CameraInfo, camera_info_topic,
+                                 self.cam_info_callback, 10)
+        self.create_subscription(CameraInfo, camera_info_topic,
+                                 self.cam_info_callback, qos_profile_sensor_data)
 
         self.ring_map = RingMap()
 
+        cv2.namedWindow('ROI', cv2.WINDOW_NORMAL)
         cv2.namedWindow('Detections', cv2.WINDOW_NORMAL)
         cv2.namedWindow('Segmentation', cv2.WINDOW_NORMAL)
 
@@ -96,24 +80,22 @@ class RingDetector(Node):
             )
             self.received_camera_info = True
 
-
-    def stream_callback(self, rgb_data, depth_data):
+    def stream_callback(self, rgb_msg, depth_msg):
+        if not self.received_camera_info:
+            return
         try:
-            cv_image  = self.bridge.compressed_imgmsg_to_cv2(rgb_data, desired_encoding='passthrough')
+            rgb_payload = np.frombuffer(rgb_msg.data, dtype=np.uint8)
+            cv_image = cv2.imdecode(rgb_payload, cv2.IMREAD_COLOR)
+
+            depth_fmt, depth_header = depth_msg.format, depth_msg.data[:12]
+            depth_payload = np.frombuffer(depth_msg.data[12:], dtype=np.uint8)
+            img_depth_raw = cv2.imdecode(depth_payload, cv2.IMREAD_UNCHANGED)
+            img_depth_meters = img_depth_raw.astype(np.float32) / 1000.0
+
+            self.detect_rings(cv_image.copy(), img_depth_meters.copy(), rgb_msg.header.stamp)
+            cv2.waitKey(1)
         except Exception as e:
             self.get_logger().error(f'{e}')
-            return
-
-        if not self.received_camera_info:
-            cv2.imshow('Detections', cv_image)
-            cv2.waitKey(1)
-            self.get_logger().warn(
-                'Waiting for camera_info',
-                throttle_duration_sec=5.0)
-            return
-
-        self.detect_rings(cv_image, None)
-        cv2.waitKey(1)
 
     def estimate_height_from_ground(self, cy, avg_depth, img_h):
         H_cam = 1.05
@@ -122,7 +104,7 @@ class RingDetector(Node):
         absolute_height = H_cam - h_rel
         return absolute_height
     
-    def get_roi(self, img_rgb, img_depth, max_depth=3.5):
+    def get_roi(self, img_rgb, img_depth, max_depth=1.5):
         h, w = img_rgb.shape[:2]
         dist_mask = (img_depth > 0.1) & (img_depth <= max_depth)
         ground_cutoff = int(h * 0.6)
@@ -134,7 +116,6 @@ class RingDetector(Node):
         roi_pixels = foreground_rgb[roi_mask].reshape((-1, 3)).astype(np.float32)
         return roi_pixels, roi_mask
 
-    
     def display_label_map(self, label_map):
         unique_labels = np.unique(label_map)
         areas = {label: np.sum(label_map == label) for label in unique_labels if label != 0}
@@ -161,154 +142,107 @@ class RingDetector(Node):
             ring_color = ring['color']
             (center, _, _) = ellipse
             cx, cy = int(center[0]), int(center[1])
-            cv2.ellipse(output, ellipse, ring_color, 2)
-            label = f"RING"
-            cv2.putText(output, label, (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ring_color, 1)
+            
+            cv2.ellipse(output, ellipse, ring_color, 7)
+            
+            label = "RING"
+            cv2.putText(
+                output, 
+                label, 
+                (cx - 20, cy - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, 
+                ring_color, 
+                2, 
+                cv2.LINE_AA
+            )
+            
         cv2.imshow('Detections', output)
-
-    def _is_hollow(self, img_depth, cx, cy, axes, avg_ring_depth,
-                   gap_thresh: float = 0.12) -> bool:
-        """Robust hollow check: the interior of a ring is either farther than
-        the ring band or invalid (laser/IR passes through).
-        Samples a patch half the minor axis wide around the centre."""
-        h, w = img_depth.shape[:2]
-        inner_r = max(2, int(min(axes) * 0.25))
-        y0, y1 = max(0, cy - inner_r), min(h, cy + inner_r + 1)
-        x0, x1 = max(0, cx - inner_r), min(w, cx + inner_r + 1)
-        patch = img_depth[y0:y1, x0:x1]
-        if patch.size == 0:
-            return False
-        invalid = np.sum(~np.isfinite(patch) | (patch <= 0.05))
-        farther = np.sum(np.isfinite(patch) & (patch > avg_ring_depth + gap_thresh))
-        total   = patch.size
-        # Either mostly invalid (laser passes through) or mostly farther.
-        return (invalid + farther) / float(total) >= 0.6
 
     def find_rings(self, label_map, img_rgb, img_depth):
         results = []
         (h, w) = label_map.shape
         unique_labels = np.unique(label_map)
 
-        # Minimum distance (pixels) from image border for a valid ring centre.
-        border = 6
-
         for val in unique_labels:
             if val == 0: continue
             mask = (label_map == val).astype(np.uint8) * 255
 
-            ring_color = self.get_average_color(img_rgb, mask)
+            ring_color = self.get_average_color(img_rgb, mask)            
 
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
-                if len(cnt) < 8: continue
-
-                cnt_area = cv2.contourArea(cnt)
-                if cnt_area < 30:
-                    continue
+                if len(cnt) < 5: continue
 
                 ellipse = cv2.fitEllipse(cnt)
-                (center, axes, _) = ellipse
+                (center, axes, angle) = ellipse
                 cx, cy = int(center[0]), int(center[1])
 
-                # Reject shapes hugging the image border (incomplete).
-                if cx < border or cy < border or cx >= w - border or cy >= h - border:
-                    continue
+                inertia_ratio = min(axes) / max(axes) if max(axes) != 0 else 0
+                if inertia_ratio < 0.35: continue
 
-                major, minor = max(axes), min(axes)
-                if major <= 0:
-                    continue
+                if 0 <= cy < h and 0 <= cx < w:
+                    obj_depths = img_depth[mask > 0]
+                    valid_depths = obj_depths[np.isfinite(obj_depths)]
+                    if valid_depths.size == 0: continue
+                    
+                    avg_ring_depth = np.median(valid_depths)
 
-                aspect = minor / major
-                if aspect < 0.40:
-                    continue
+                    pixel_width = max(axes)
+                    physical_diameter = (pixel_width * avg_ring_depth) / self.fx
 
-                # Circularity: contour area vs ellipse area. A well-fit ring
-                # has a ratio near 1; irregular blobs score much lower.
-                ellipse_area = math.pi * 0.25 * major * minor
-                if ellipse_area <= 0:
-                    continue
-                circ = cnt_area / ellipse_area
-                if not (0.55 < circ < 1.25):
-                    continue
+                    center_depth = img_depth[cy, cx]
+                    is_hollow = not np.isfinite(center_depth) or (center_depth - avg_ring_depth) > 0.15
 
-                if not (0 <= cy < h and 0 <= cx < w):
-                    continue
-
-                obj_depths = img_depth[mask > 0]
-                valid_depths = obj_depths[np.isfinite(obj_depths) & (obj_depths > 0.05)]
-                if valid_depths.size < 20:
-                    continue
-                avg_ring_depth = float(np.median(valid_depths))
-
-                # Require the ring band to have low depth spread. A flat poster
-                # or the wall has a tight spread; noise/depth artefacts don't.
-                depth_std = float(np.std(valid_depths))
-                if depth_std > 0.25:
-                    continue
-
-                physical_diameter = (major * avg_ring_depth) / self.fx
-
-                if not self._is_hollow(img_depth, cx, cy, axes, avg_ring_depth):
-                    continue
-
-                height = self.estimate_height_from_ground(cy, avg_ring_depth, 240)
-                if not (0.07 < physical_diameter < 0.35):
-                    continue
-                if not (1.35 < height < 1.85):
-                    continue
-
-                results.append({
-                    'ellipse': ellipse,
-                    'color': ring_color,
-                    'depth': avg_ring_depth,
-                })
+                    height = self.estimate_height_from_ground(cy, avg_ring_depth, 240)
+                    if 0.08 < physical_diameter < 0.3 and is_hollow and (0.3 < height < 2.0):
+                        results.append({
+                            'ellipse': ellipse,
+                            'color': ring_color,
+                            'depth': avg_ring_depth
+                        })
         return results
 
-    def localize(self, rings):
-        if self.fx is None:
-            return
+    def _project_to_map(self, cx, cy, z, stamp):
+        if self.fx is None or self.cx_principal is None:
+            return None
+        z_opt = float(z)
+        x_opt = (cx - self.cx_principal) * z_opt / self.fx
+        y_opt = (cy - self.cy_principal) * z_opt / self.fy
 
-        target_frame = 'map'
-        camera_frame = self._camera_frame
+        pt = PointStamped()
+        pt.header.frame_id = 'gemini_color_optical_frame' 
+        pt.header.stamp = stamp
+        pt.point.x = x_opt
+        pt.point.y = y_opt
+        pt.point.z = z_opt
 
-        # Skip silently until the map frame is available (AMCL still converging).
-        if not self.tf_buffer.can_transform(
-                target_frame, camera_frame, Time(),
-                timeout=rclpy.duration.Duration(seconds=0.05)):
-            self.get_logger().warn(
-                f'TF {camera_frame} -> {target_frame} not yet available; '
-                'ring localization paused.',
-                throttle_duration_sec=5.0)
-            return
+        stamp_time = Time.from_msg(stamp)
+        if self.tf_buffer.can_transform('map', pt.header.frame_id, stamp_time, 
+                                        timeout=rclpy.duration.Duration(seconds=0.05)):
+            try:
+                pt_map = self.tf_buffer.transform(pt, 'map')
+                return np.array([pt_map.point.x, pt_map.point.y, pt_map.point.z])
+            except:
+                pass
 
+        pt.header.stamp = Time().to_msg()
+        try:
+            pt_map = self.tf_buffer.transform(pt, 'map', timeout=rclpy.duration.Duration(seconds=0.05))
+            return np.array([pt_map.point.x, pt_map.point.y, pt_map.point.z])
+        except Exception as e:
+            self.get_logger().warn(f'TF lookup failed: {e}', throttle_duration_sec=5.0)
+            return None
+
+    def localize_rings(self, rings, stamp):
         for ring in rings:
-            (center, _, _) = ring['ellipse']
+            (center, axes, angle) = ring['ellipse']
             cx_px, cy_px = center
             depth = ring['depth']
-
-            X_cam_opt = (cx_px - self.cx_principal) * depth / self.fx
-            Y_cam_opt = (cy_px - self.cy_principal) * depth / self.fy
-
-            pt_cam = PointStamped()
-            pt_cam.header.frame_id = camera_frame
-            pt_cam.header.stamp = Time().to_msg()
-            pt_cam.point.x = float(depth)
-            pt_cam.point.y = float(-X_cam_opt)
-            pt_cam.point.z = float(-Y_cam_opt)
-
-            try:
-                pt_world = self.tf_buffer.transform(
-                    pt_cam, target_frame,
-                    timeout=rclpy.duration.Duration(seconds=0.1)
-                )
-            except Exception as e:
-                self.get_logger().warn(
-                    f'TF transform failed: {e}', throttle_duration_sec=5.0)
-                continue
-
-            pos = np.array([pt_world.point.x, pt_world.point.y, pt_world.point.z])
-            self.ring_map.update(pos, ring['color'])
+            pos_map = self._project_to_map(cx_px, cy_px, depth, stamp)
+            if pos_map is not None:
+                self.ring_map.update(pos_map, ring['color'])
 
         self._publish_confirmed()
 
@@ -345,11 +279,11 @@ class RingDetector(Node):
             label.id = lm.id
             label.type = Marker.TEXT_VIEW_FACING
             label.action = Marker.ADD
-            label.pose.position.x = float(lm.position[0])
-            label.pose.position.y = float(lm.position[1])
-            label.pose.position.z = float(lm.position[2]) + 0.25
+            sphere.pose.position.x = float(lm.position[0])
+            sphere.pose.position.y = float(lm.position[1])
+            sphere.pose.position.z = float(lm.position[2])
             label.pose.orientation.w = 1.0
-            label.scale = Vector3(x=0.0, y=0.0, z=0.15)
+            sphere.scale = Vector3(x=0.15, y=0.15, z=0.15)
             label.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
             label.text = f'Ring {lm.id}'
             marker_array.markers.append(label)
@@ -357,33 +291,36 @@ class RingDetector(Node):
         if len(marker_array.markers) > 0:
             self.ring_pub.publish(marker_array)
 
-    def detect_rings(self, img_rgb, img_depth):
-        # roi_pixels, roi_mask = self.get_roi(img_rgb, img_depth)
-        label_map = self.object_detector.get_labels(
-            img_rgb, 
+    def detect_rings(self, img_rgb, img_depth, stamp):
+        _, roi_mask = self.get_roi(img_rgb, img_depth)
+        
+        masked_rgb = np.zeros_like(img_rgb)
+        masked_rgb[roi_mask] = img_rgb[roi_mask]
+        cv2.imshow('ROI', masked_rgb)
+
+        from color_segmentation import ObjectDetector
+        detector = ObjectDetector()
+        label_map = detector.get_labels(
+            masked_rgb,
             downscale_factor=2,
-            n_clusters=5,
-            sample_size=10_000,
-            min_area=3200,
+            n_clusters=9,
+            sample_size=5_000,
+            min_area=1500,
+            max_area=7000,
             morph_kernel_size=5,
             morph_iterations=2,
         )
         self.display_label_map(label_map)
-        # rings = self.find_rings(label_map, img_rgb, img_depth)
-        # self.display_detections(img_rgb, rings)
+        rings = self.find_rings(label_map, img_rgb, img_depth)
+        self.display_detections(img_rgb, rings)
+        self.localize_rings(rings, stamp)
 
-        # close_rings = [ring for ring in rings if ring['depth'] < 2]
-
-        # self.localize(close_rings)
-
+        
 
 def main():
-
     rclpy.init(args=None)
     rd_node = RingDetector()
-
     rclpy.spin(rd_node)
-
     cv2.destroyAllWindows()
 
 

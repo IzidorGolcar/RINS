@@ -29,13 +29,10 @@ install(DIRECTORY
 
 install(PROGRAMS
   scripts/robot_commander.py
-  scripts/faces/detect_people2.py
-  scripts/faces/detect_people3.py
+  scripts/faces/detect_people_mp.py
+  scripts/faces/detect_people_yolo.py
   scripts/task1.py
   scripts/rings/detect_rings.py
-  scripts/rings/detect_rings2.py
-  scripts/rings/detect_rings3.py
-  scripts/rings/detect_rings4.py
   scripts/rings/ring_map.py
   scripts/rings/color_segmentation.py
   DESTINATION lib/${PROJECT_NAME})

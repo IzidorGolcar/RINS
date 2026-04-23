@@ -100,7 +100,29 @@ class FaceDetector(Node):
         self.marker_pub = self.create_publisher(
             MarkerArray, '/people_markers', self.MARKER_QOS)
 
+        cv2.namedWindow('ROI', cv2.WINDOW_NORMAL)
         self.get_logger().info("Face detector initialized")
+
+    # ---------------- ROI FILTERING ----------------
+
+    ROI_MAX_DEPTH = 2.0        # metres — matches MAX_DIST
+    ROI_GROUND_CUTOFF = 0.75   # rows below this fraction of image height are ground
+    ROI_SKY_CUTOFF = 0.25
+
+    def _get_roi_mask(self, img_rgb: np.ndarray, depth_image: np.ndarray) -> np.ndarray:
+        """Return a boolean mask of pixels worth examining.
+
+        Mirrors detect_rings.get_roi():
+          • keeps pixels whose depth is within (0.1, ROI_MAX_DEPTH]
+          • blanks the bottom ROI_GROUND_CUTOFF fraction of the image (ground plane)
+        """
+        h, w = img_rgb.shape[:2]
+        mask = (depth_image > 0.1) & (depth_image <= self.ROI_MAX_DEPTH)
+        ground_row = int(h * self.ROI_GROUND_CUTOFF)
+        sky_row = int(h * self.ROI_SKY_CUTOFF)
+        mask[ground_row:, :] = False
+        mask[:sky_row, :] = False
+        return mask
 
     # ---------------- MEDIAPIPE ----------------
 
@@ -168,9 +190,17 @@ class FaceDetector(Node):
                 interpolation=cv2.INTER_NEAREST,
             )
 
+        # Blank out pixels outside the depth-based ROI before feeding MediaPipe.
+        # This suppresses detections on far-away objects, ground-plane artefacts,
+        # and anything beyond MAX_DIST — mirroring detect_rings.get_roi().
+        roi_mask = self._get_roi_mask(cv_image, depth_image)
+        masked_rgb = np.zeros_like(cv_image)
+        masked_rgb[roi_mask] = cv_image[roi_mask]
+        cv2.imshow('ROI', masked_rgb)
+
         # Downsample + BGR→RGB in one step for MediaPipe.
         s = self.INFER_SCALE
-        proc = cv2.resize(cv_image, None, fx=1.0 / s, fy=1.0 / s,
+        proc = cv2.resize(masked_rgb, None, fx=1.0 / s, fy=1.0 / s,
                           interpolation=cv2.INTER_AREA)
         proc = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
 
@@ -314,7 +344,7 @@ class FaceDetector(Node):
 
             # Match to a candidate — increment, promote when it hits CONFIRM_HITS.
             hit_candidate = False
-            for cand in self.candidates:
+            for i, cand in enumerate(self.candidates):
                 if np.linalg.norm(pos - cand['pos']) < self.CANDIDATE_RADIUS:
                     cand['pos'] = 0.5 * cand['pos'] + 0.5 * pos
                     cand['hits'] += 1
@@ -332,7 +362,7 @@ class FaceDetector(Node):
                                 'last_seen': now,
                             })
                             self._next_face_id += 1
-                        self.candidates.remove(cand)
+                        del self.candidates[i]
                     break
             if hit_candidate:
                 continue

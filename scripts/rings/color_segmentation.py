@@ -46,6 +46,7 @@ class ObjectDetector:
             self,
             clustered_img: np.ndarray,
             min_area=800,
+            max_area=5000,
             morph_kernel_size=5,
             morph_iterations=2,
     ):
@@ -74,7 +75,7 @@ class ObjectDetector:
             n_cc, cc_labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
             
             for comp in range(1, n_cc):
-                if stats[comp, cv2.CC_STAT_AREA] >= min_area:
+                if min_area <= stats[comp, cv2.CC_STAT_AREA] <= max_area:
                     label_map[cc_labels == comp] = next_label
                     next_label += 1
 
@@ -93,14 +94,16 @@ class ObjectDetector:
             n_clusters=10,
             sample_size=10_000,
             min_area=3200,
+            max_area=6000,
             morph_kernel_size=5,
             morph_iterations=2,
 
     ):
         min_area = min_area / (downscale_factor ** 2)
+        max_area = max_area / (downscale_factor ** 2)
         h, w = image.shape[:2]
         small = cv2.resize(image, (w // downscale_factor, h // downscale_factor),
                            interpolation=cv2.INTER_AREA)
         clustered = self._cluster(small, n_clusters, sample_size)
-        segmented = self._segment_objects(clustered, min_area, morph_kernel_size, morph_iterations)
+        segmented = self._segment_objects(clustered, min_area, max_area, morph_kernel_size, morph_iterations)
         return cv2.resize(segmented, (w, h), interpolation=cv2.INTER_NEAREST)
