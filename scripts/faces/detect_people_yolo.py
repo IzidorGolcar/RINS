@@ -15,6 +15,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                        QoSProfile, QoSReliabilityPolicy,
                        qos_profile_sensor_data)
 from sensor_msgs.msg import CameraInfo, CompressedImage
+from nav_msgs.msg import OccupancyGrid
 import tf2_geometry_msgs  # noqa: F401  (registers PointStamped transform)
 import tf2_ros
 from ultralytics import YOLO
@@ -25,6 +26,8 @@ class FaceDetector(Node):
     CONFIDENCE_THRESH   = 0.35  # minimum YOLO confidence
     MIN_DIST            = 0.3   # metres – discard closer detections
     MAX_DIST            = 5.0   # metres – discard farther detections
+    FACE_MIN_HEIGHT_M   = 0.0   # metres – map-frame Z lower bound
+    FACE_MAX_HEIGHT_M   = 0.8   # metres – faces live inside rings
     FACE_MIN_SEPARATION = 0.8   # metres – same face if closer than this
     CONFIRM_HITS        = 3     # detections needed before face is confirmed
     CANDIDATE_RADIUS    = 0.5   # metres – cluster radius for candidates
@@ -69,6 +72,7 @@ class FaceDetector(Node):
 
         self.candidates: list[dict] = []
         self.confirmed_faces: list[np.ndarray] = []
+        self._arena_polygon: np.ndarray | None = None
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -101,6 +105,13 @@ class FaceDetector(Node):
 
         self.marker_pub = self.create_publisher(
             MarkerArray, '/people_markers', self.MARKER_QOS)
+
+        map_qos = QoSProfile(
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1)
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
 
         self._torch.set_grad_enabled(False)
         self.model = YOLO('yolov8n.pt')
@@ -151,6 +162,31 @@ class FaceDetector(Node):
             self.fy = msg.k[4]
             self.cx_p = msg.k[2]
             self.cy_p = msg.k[5]
+
+    def _map_cb(self, msg: OccupancyGrid) -> None:
+        """Build convex-hull polygon of free cells — same arena the waypoints cover."""
+        data = np.array(msg.data, dtype=np.int8).reshape(
+            msg.info.height, msg.info.width)
+        ys, xs = np.where(data == 0)
+        if ys.size < 3:
+            return
+        res = msg.info.resolution
+        ox = msg.info.origin.position.x
+        oy = msg.info.origin.position.y
+        wx = ox + xs.astype(np.float32) * res
+        wy = oy + ys.astype(np.float32) * res
+        pts = np.column_stack([wx, wy]).astype(np.float32)
+        self._arena_polygon = cv2.convexHull(pts)
+
+    ARENA_TOLERANCE_M = 0.15     # faces sit on walls — allow slight outside-of-hull error
+
+    def _is_in_arena(self, x: float, y: float) -> bool:
+        if self._arena_polygon is None:
+            return True
+        # measureDist=True returns signed distance: + inside, - outside (metres here).
+        dist = cv2.pointPolygonTest(
+            self._arena_polygon, (float(x), float(y)), True)
+        return dist >= -self.ARENA_TOLERANCE_M
 
     def _decode_depth(self, depth_msg: CompressedImage) -> np.ndarray | None:
         # compressedDepth = 12-byte ConfigHeader + PNG payload.
@@ -262,6 +298,10 @@ class FaceDetector(Node):
 
                 pos = self._project_to_map(cx, cy, z, rgb_msg.header.stamp)
                 if pos is None:
+                    continue
+                if not (self.FACE_MIN_HEIGHT_M <= pos[2] <= self.FACE_MAX_HEIGHT_M):
+                    continue
+                if not self._is_in_arena(pos[0], pos[1]):
                     continue
 
                 if any(

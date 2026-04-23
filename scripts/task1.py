@@ -23,7 +23,7 @@ from robot_commander import RobotCommander  # noqa: E402
 # Distance between parallel rows (and between points within each row).
 # 1.5 m works well for arenas up to ~10 × 10 m with OAK-D's ~3.5 m range.
 # Increase for faster (but sparser) coverage; decrease for thoroughness.
-COVERAGE_SPACING = 0.65 # meters
+COVERAGE_SPACING = 0.4 # meters
 
 # Sweep axis for the boustrophedon:
 #   'y' – horizontal rows (robot sweeps left-right, rows advance up/down)
@@ -38,12 +38,10 @@ ARENA_X_MAX: float | None =  None
 ARENA_Y_MIN: float | None =  None
 ARENA_Y_MAX: float | None =  None
 
-NUM_FACES = 3
-NUM_RINGS = 0
+NUM_FACES = 8
+NUM_RINGS = 4
 APPROACH_DIST = 0.25
 NAV_WAIT_TIMEOUT_SEC = 8.0
-FACE_MIN_HEIGHT_M = 0.0
-FACE_MAX_HEIGHT_M = 0.75
 GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
 ESPEAK_SPEED = 140      # words per minute
@@ -334,11 +332,6 @@ class Task1Node(RobotCommander):
                 if fid in self.known_faces:
                     continue
                 pos = (m.pose.position.x, m.pose.position.y, m.pose.position.z)
-                if not (FACE_MIN_HEIGHT_M <= pos[2] <= FACE_MAX_HEIGHT_M):
-                    self.info(
-                        f'Ignoring face #{fid}: height {pos[2]:.2f} m out of range '
-                        f'[{FACE_MIN_HEIGHT_M:.2f}, {FACE_MAX_HEIGHT_M:.2f}] m.')
-                    continue
                 self.known_faces[fid] = pos
                 if fid not in self.greeted_ids:
                     self.to_greet.append(fid)

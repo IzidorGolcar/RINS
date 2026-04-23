@@ -19,7 +19,7 @@ class RingLandmark:
 
     CONFIRM_OBS   = 10
     CONFIRM_TRACE = 0.16
-    MERGE_DIST    = 1.5 # m 
+    MERGE_DIST    = 0.5 # m 
 
 
 class RingMap:
