@@ -161,11 +161,12 @@ class RingDetector(Node):
 
     # ---------------- GEOMETRY HELPERS ----------------
 
+    H_CAM = 0.22  # TurtleBot4 Gemini height above the floor (real robot).
+
     def estimate_height_from_ground(self, cy, avg_depth, img_h):
-        H_cam = 1.05
         dy = cy - self.cy_principal
         h_rel = (dy * avg_depth) / self.fy
-        absolute_height = H_cam - h_rel
+        absolute_height = self.H_CAM - h_rel
         return absolute_height
 
     def display_label_map(self, label_map):
@@ -208,7 +209,7 @@ class RingDetector(Node):
         cv2.imshow('Detections', output)
 
     def _is_hollow(self, img_depth, cx, cy, axes, avg_ring_depth,
-                   gap_thresh: float = 0.12) -> bool:
+                   gap_thresh: float = 0.08) -> bool:
         """Hollow check: the interior of a real ring is either farther than
         the ring band or invalid (IR passes through)."""
         h, w = img_depth.shape[:2]
@@ -221,7 +222,7 @@ class RingDetector(Node):
         invalid = np.sum(~np.isfinite(patch) | (patch <= 0.05))
         farther = np.sum(np.isfinite(patch) & (patch > avg_ring_depth + gap_thresh))
         total   = patch.size
-        return (invalid + farther) / float(total) >= 0.6
+        return (invalid + farther) / float(total) >= 0.35
 
     # ---------------- RING DETECTION ----------------
 
@@ -229,6 +230,7 @@ class RingDetector(Node):
         results = []
         (h, w) = label_map.shape
         unique_labels = np.unique(label_map)
+        counts = {'shape': 0, 'depth': 0, 'hollow': 0, 'size': 0, 'height': 0, 'ok': 0}
 
         # Minimum distance (pixels) from image border for a valid ring centre.
         border = 6
@@ -272,35 +274,50 @@ class RingDetector(Node):
                 if not (0.55 < circ < 1.25):
                     continue
 
-                if not (0 <= cy < h and 0 <= cx < w):
-                    continue
+                counts['shape'] += 1
 
                 obj_depths = img_depth[mask > 0]
                 valid_depths = obj_depths[np.isfinite(obj_depths) & (obj_depths > 0.05)]
-                if valid_depths.size < 20:
+                if valid_depths.size < 10:
                     continue
                 avg_ring_depth = float(np.median(valid_depths))
 
                 depth_std = float(np.std(valid_depths))
-                if depth_std > 0.25:
+                if depth_std > 0.4:
                     continue
 
-                physical_diameter = (major * avg_ring_depth) / self.fx
+                counts['depth'] += 1
 
                 if not self._is_hollow(img_depth, cx, cy, axes, avg_ring_depth):
                     continue
 
+                counts['hollow'] += 1
+
+                physical_diameter = (major * avg_ring_depth) / self.fx
+                if not (0.05 < physical_diameter < 0.45):
+                    continue
+
+                counts['size'] += 1
+
                 height = self.estimate_height_from_ground(cy, avg_ring_depth, 240)
-                if not (0.07 < physical_diameter < 0.35):
+                if not (0.0 < height < 1.85):
                     continue
-                if not (1.35 < height < 1.85):
-                    continue
+
+                counts['height'] += 1
+                counts['ok'] += 1
 
                 results.append({
                     'ellipse': ellipse,
                     'color': ring_color,
                     'depth': avg_ring_depth,
                 })
+
+        if any(counts.values()):
+            self.get_logger().info(
+                f"find_rings stages shape={counts['shape']} depth={counts['depth']} "
+                f"hollow={counts['hollow']} size={counts['size']} "
+                f"height={counts['height']} ok={counts['ok']}",
+                throttle_duration_sec=2.0)
         return results
 
     # ---------------- LOCALIZATION ----------------
@@ -402,8 +419,8 @@ class RingDetector(Node):
         label_map = self.object_detector.get_labels(
             img_rgb,
             downscale_factor=2,
-            n_clusters=9,
-            sample_size=10_000,
+            n_clusters=7,
+            sample_size=15_000,
             min_area=200,
             morph_kernel_size=5,
             morph_iterations=1,
