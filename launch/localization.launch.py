@@ -26,7 +26,7 @@ from launch_ros.actions import PushRosNamespace
 
 
 ARGUMENTS = [
-    DeclareLaunchArgument('use_sim_time', default_value='true',choices=['true', 'false'],description='Use sim time'),
+    DeclareLaunchArgument('use_sim_time', default_value='false',choices=['true', 'false'],description='Use sim time'),
     DeclareLaunchArgument('namespace', default_value='',description='Robot namespace')
 ]
 
@@ -42,7 +42,7 @@ def generate_launch_description():
 
     map_arg = DeclareLaunchArgument(
         'map',
-        default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'maps', 'map.yaml']),
+        default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'maps', 'task1.yaml']),
         description='Full path to map yaml file to load'
     )
 

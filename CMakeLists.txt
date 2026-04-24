@@ -29,10 +29,12 @@ install(DIRECTORY
 
 install(PROGRAMS
   scripts/robot_commander.py
-  scripts/detect_people.py
+  scripts/faces/detect_people_mp.py
+  scripts/faces/detect_people_yolo.py
   scripts/task1.py
-  scripts/detect_rings.py
-  scripts/ring_map.py
+  scripts/rings/detect_rings.py
+  scripts/rings/ring_map.py
+  scripts/rings/color_segmentation.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
