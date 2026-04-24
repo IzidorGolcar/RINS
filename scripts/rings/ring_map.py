@@ -17,8 +17,8 @@ class RingLandmark:
         arr = np.array(self.color_history, dtype=np.uint8)
         return tuple(np.median(arr, axis=0).astype(np.uint8).tolist())
 
-    CONFIRM_OBS   = 10
-    CONFIRM_TRACE = 0.16
+    CONFIRM_OBS   = 6
+    CONFIRM_TRACE = 0.22
     MERGE_DIST    = 0.5 # m 
 
 

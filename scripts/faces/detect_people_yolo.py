@@ -23,15 +23,16 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 class FaceDetector(Node):
-    CONFIDENCE_THRESH   = 0.35  # minimum YOLO confidence
-    MIN_DIST            = 0.3   # metres – discard closer detections
-    MAX_DIST            = 5.0   # metres – discard farther detections
+    CONFIDENCE_THRESH   = 0.24  # minimum YOLO confidence
+    MIN_DIST            = 0.07   # metres – discard closer detections
+    MAX_DIST            = 6.5   # metres – discard farther detections
     FACE_MIN_HEIGHT_M   = 0.0   # metres – map-frame Z lower bound
-    FACE_MAX_HEIGHT_M   = 0.8   # metres – faces live inside rings
-    FACE_MIN_SEPARATION = 0.8   # metres – same face if closer than this
-    CONFIRM_HITS        = 3     # detections needed before face is confirmed
-    CANDIDATE_RADIUS    = 0.5   # metres – cluster radius for candidates
-    DEPTH_SAMPLE_RADIUS = 5     # pixels – neighbourhood radius for depth
+    FACE_MAX_HEIGHT_M   = 1.1   # metres – allow varied face sizes/heights
+    FACE_MIN_SEPARATION = 0.35  # metres – same face if closer than this
+    CONFIRM_HITS        = 1     # detections needed before face is confirmed
+    CANDIDATE_RADIUS    = 0.6   # metres – cluster radius for candidates
+    DEPTH_SAMPLE_RADIUS = 6     # pixels – neighbourhood radius for depth
+    DEPTH_STD_MAX       = 0.45  # metres – tolerate noisier depth at range
     TARGET_FRAME        = 'map'
 
     MARKER_QOS = QoSProfile(
@@ -287,9 +288,9 @@ class FaceDetector(Node):
                 patch = depth_image[max(0, dy_ - r):dy_ + r + 1,
                                     max(0, dx_ - r):dx_ + r + 1]
                 valid = patch[np.isfinite(patch) & (patch > 0)]
-                if valid.size < 8:
+                if valid.size < 5:
                     continue
-                if float(np.std(valid)) > 0.25:
+                if float(np.std(valid)) > self.DEPTH_STD_MAX:
                     continue
 
                 z = float(np.median(valid))

@@ -23,7 +23,7 @@ from robot_commander import RobotCommander  # noqa: E402
 # Distance between parallel rows (and between points within each row).
 # 1.5 m works well for arenas up to ~10 × 10 m with OAK-D's ~3.5 m range.
 # Increase for faster (but sparser) coverage; decrease for thoroughness.
-COVERAGE_SPACING = 0.4 # meters
+COVERAGE_SPACING = 0.38 # meters
 
 # Sweep axis for the boustrophedon:
 #   'y' – horizontal rows (robot sweeps left-right, rows advance up/down)
@@ -41,48 +41,34 @@ ARENA_Y_MAX: float | None =  None
 NUM_FACES = 8
 NUM_RINGS = 4
 APPROACH_DIST = 0.25
-NAV_WAIT_TIMEOUT_SEC = 8.0
+NAV_WAIT_TIMEOUT_SEC = 35.0
+RECOVERY_BACKUP_DIST = 0.25
+RECOVERY_TIMEOUT_SEC = 5.0
 GREETING_TEXT = "Hello! I found your face. Pleased to meet you!"
 RING_GREETING_TEMPLATE = "Hello! I found a {color} ring!"
 ESPEAK_SPEED = 140      # words per minute
 
 
-def _bgr_to_color_name(bgr: tuple[int, int, int]) -> str:
-    """Map an average BGR colour to a human-readable name."""
+def _bgr_to_color_name(bgr: tuple[int, int, int]) -> str | None:
+    """Map ring color to allowed set or None for ambiguous colors."""
     b, g, r = int(bgr[0]), int(bgr[1]), int(bgr[2])
     mx = max(r, g, b)
     mn = min(r, g, b)
-    sat = (mx - mn) / max(mx, 1)
 
-    if sat < 0.20:
-        if mx > 200:
-            return 'white'
-        if mx < 60:
-            return 'black'
-        return 'grey'
+    if mx < 70:
+        return 'black'
 
-    if mx == r:
-        h = 60.0 * ((g - b) / (mx - mn) % 6)
-    elif mx == g:
-        h = 60.0 * ((b - r) / (mx - mn) + 2)
-    else:
-        h = 60.0 * ((r - g) / (mx - mn) + 4)
+    # Reject low-saturation non-black colors (usually gray/white false detections).
+    if (mx - mn) < 45:
+        return None
 
-    if h < 15 or h >= 345:
+    if r >= g and r >= b:
         return 'red'
-    if h < 45:
-        return 'orange'
-    if h < 75:
-        return 'yellow'
-    if h < 150:
+    if g >= r and g >= b:
         return 'green'
-    if h < 195:
-        return 'cyan'
-    if h < 255:
+    if b >= r and b >= g:
         return 'blue'
-    if h < 315:
-        return 'purple'
-    return 'pink'
+    return None
 
 
 
@@ -108,6 +94,11 @@ class Task1Node(RobotCommander):
     """Extends RobotCommander with boustrophedon search and face greeting."""
     def __init__(self):
         super().__init__(node_name='task1')
+
+        self.declare_parameters('', [
+            ('enable_startup_spin', True),
+        ])
+        self.enable_startup_spin = self.get_parameter('enable_startup_spin').get_parameter_value().bool_value
 
         self.coverage_waypoints: list[tuple[float, float, float]] = []
         self._map_info = None
@@ -358,8 +349,12 @@ class Task1Node(RobotCommander):
                 self.known_rings[rid] = pos
                 self.ring_colors[rid] = bgr
                 if rid not in self.greeted_ring_ids:
-                    self.to_greet_rings.append(rid)
                     color_name = _bgr_to_color_name(bgr)
+                    if color_name is None:
+                        self.warn(
+                            f'Ignoring ring #{rid}: non-target color {bgr}.')
+                        continue
+                    self.to_greet_rings.append(rid)
                     self.info(
                         f'New {color_name} ring #{rid} queued at '
                         f'({pos[0]:.2f}, {pos[1]:.2f})')
@@ -377,10 +372,12 @@ class Task1Node(RobotCommander):
         if self.current_ring_id is not None:
             return ('ring', self.current_ring_id)
         if not (hasattr(self, 'current_pose') and self.current_pose is not None):
-            if NUM_FACES > 0 and self.to_greet:
-                return ('face', self.to_greet.popleft())
             if NUM_FACES <= 0 and NUM_RINGS <= 0:
                 raise RuntimeError('No goals queued and both faces/rings are disabled.')
+            if NUM_RINGS > 0 and self.to_greet_rings:
+                return ('ring', self.to_greet_rings.popleft())
+            if NUM_FACES > 0 and self.to_greet:
+                return ('face', self.to_greet.popleft())
             if NUM_RINGS <= 0:
                 raise RuntimeError('No face goals queued and rings are disabled.')
             return ('ring', self.to_greet_rings.popleft())
@@ -389,18 +386,20 @@ class Task1Node(RobotCommander):
         best_dist = float('inf')
         best_type = 'face'
         best_id = -1
-        if NUM_FACES > 0:
-            for fid in self.to_greet:
-                fx, fy, _ = self.known_faces[fid]
-                d = math.hypot(fx - rx, fy - ry)
-                if d < best_dist:
-                    best_dist, best_type, best_id = d, 'face', fid
+
         if NUM_RINGS > 0:
             for rid in self.to_greet_rings:
                 rx2, ry2, _ = self.known_rings[rid]
                 d = math.hypot(rx2 - rx, ry2 - ry)
                 if d < best_dist:
                     best_dist, best_type, best_id = d, 'ring', rid
+
+        if NUM_FACES > 0:
+            for fid in self.to_greet:
+                fx, fy, _ = self.known_faces[fid]
+                d = math.hypot(fx - rx, fy - ry)
+                if d < best_dist:
+                    best_dist, best_type, best_id = d, 'face', fid
         if best_id < 0:
             raise RuntimeError('No eligible goal found for current task settings.')
         if best_type == 'face':
@@ -438,8 +437,70 @@ class Task1Node(RobotCommander):
         while time.time() < end_time:
             self._spin_ros(timeout=0.05)
 
+    def _look_at_ring(self, ring_id: int) -> None:
+        """Rotate in place to face the detected ring before greeting."""
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            return
+
+        rx, ry, _ = self.known_rings[ring_id]
+        cx = self.current_pose.pose.position.x
+        cy = self.current_pose.pose.position.y
+        target_yaw = math.atan2(ry - cy, rx - cx)
+
+        q = self.current_pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        delta_yaw = math.atan2(
+            math.sin(target_yaw - current_yaw),
+            math.cos(target_yaw - current_yaw),
+        )
+
+        if abs(delta_yaw) > 0.05:
+            spin_time = max(3, int(abs(delta_yaw) / 0.8) + 2)
+            self.spin(spin_dist=delta_yaw, time_allowance=spin_time)
+            self._wait_nav(allow_interrupt=False)
+
+        end_time = time.time() + 0.4
+        while time.time() < end_time:
+            self._spin_ros(timeout=0.05)
+
     def _spin_ros(self, timeout: float = 0.05) -> None:
         rclpy.spin_once(self, timeout_sec=timeout)
+
+    def _recover_from_obstacle(self) -> bool:
+        """Back up a bit and yield control to planner for a new route."""
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            return False
+
+        cx = self.current_pose.pose.position.x
+        cy = self.current_pose.pose.position.y
+        q = self.current_pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        retreat = PoseStamped()
+        retreat.header.frame_id = 'map'
+        retreat.header.stamp = self.get_clock().now().to_msg()
+        retreat.pose.position.x = cx - RECOVERY_BACKUP_DIST * math.cos(yaw)
+        retreat.pose.position.y = cy - RECOVERY_BACKUP_DIST * math.sin(yaw)
+        retreat.pose.position.z = 0.0
+        retreat.pose.orientation = self.YawToQuaternion(yaw)
+
+        self.warn('Navigation blocked: backing up and trying alternate path.')
+        if not self.goToPose(retreat):
+            return False
+
+        start = time.time()
+        while not self.isTaskComplete():
+            self._spin_ros(timeout=0.05)
+            if (time.time() - start) >= RECOVERY_TIMEOUT_SEC:
+                self.cancelTask()
+                return False
+
+        return True
 
     def _wait_nav(self, allow_interrupt: bool = True) -> bool:
         """Spin until current Nav2 goal finishes.
@@ -561,6 +622,16 @@ class Task1Node(RobotCommander):
 
     def run(self) -> None:
         self.waitUntilNav2Active()
+        
+        # Perform startup spin to improve localization if enabled
+        if self.enable_startup_spin:
+            self.info('Performing 360° startup spin to improve localization...')
+            self.spin(spin_dist=2 * math.pi, time_allowance=20)
+            if not self._wait_nav(allow_interrupt=False):
+                self.warn('Startup spin was interrupted or failed; continuing anyway.')
+            else:
+                self.info('Startup spin completed.')
+        
         self.info('Waiting for /map to build coverage path...')
         while not self.coverage_waypoints and rclpy.ok():
             self._spin_ros(0.1)
@@ -579,7 +650,7 @@ class Task1Node(RobotCommander):
 
         self.info(
             f'Starting search over {len(self.coverage_waypoints)} waypoints.')
-        self._say("Let's do the job")
+        self._say("Let's start")
 
         while rclpy.ok():
 
@@ -628,6 +699,7 @@ class Task1Node(RobotCommander):
                         self.waypoint_fail_count = 0
                         self.state = State.APPROACHING
                     else:
+                        self._recover_from_obstacle()
                         self.waypoint_fail_count += 1
                         if self.waypoint_fail_count >= self.MAX_WAYPOINT_RETRIES:
                             self.warn(
@@ -635,6 +707,12 @@ class Task1Node(RobotCommander):
                                 f'at ({wp[0]:.2f}, {wp[1]:.2f}).')
                             self.waypoint_idx += 1
                             self.waypoint_fail_count = 0
+                        else:
+                            # Probe a different route by advancing to next waypoint.
+                            self.waypoint_idx = min(
+                                self.waypoint_idx + 1,
+                                len(self.coverage_waypoints)
+                            )
                 else:
                     self.waypoint_idx += 1
                     self.waypoint_fail_count = 0
@@ -666,7 +744,7 @@ class Task1Node(RobotCommander):
                         self.current_ring_id = goal_id
                         self.current_face_id = None
                         rx2, ry2, _ = self.known_rings[goal_id]
-                        color_name = _bgr_to_color_name(self.ring_colors[goal_id])
+                        color_name = _bgr_to_color_name(self.ring_colors[goal_id]) or 'black'
                         self.info(
                             f'Approaching {color_name} ring #{goal_id} '
                             f'at ({rx2:.2f}, {ry2:.2f}).')
@@ -687,6 +765,7 @@ class Task1Node(RobotCommander):
                 if completed:
                     self.state = State.GREETING
                 else:
+                    self._recover_from_obstacle()
                     retries = self.approach_fail_count.get(goal_id, 0) + 1
                     self.approach_fail_count[goal_id] = retries
                     if retries >= self.MAX_APPROACH_RETRIES:
@@ -724,7 +803,8 @@ class Task1Node(RobotCommander):
 
                 elif self.current_ring_id is not None:
                     ring_id = self.current_ring_id
-                    color_name = _bgr_to_color_name(self.ring_colors[ring_id])
+                    self._look_at_ring(ring_id)
+                    color_name = _bgr_to_color_name(self.ring_colors[ring_id]) or 'black'
                     text = RING_GREETING_TEMPLATE.format(color=color_name)
                     self._say(text)
                     self.greeted_ring_ids.add(ring_id)

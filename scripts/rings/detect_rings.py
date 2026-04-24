@@ -23,6 +23,9 @@ from ring_map import *
 
 class RingDetector(Node):
 
+    BLACK_MAX_V = 95
+    BLACK_MAX_S = 80
+
     MARKER_QOS = QoSProfile(
         durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         reliability=QoSReliabilityPolicy.RELIABLE,
@@ -104,7 +107,7 @@ class RingDetector(Node):
         absolute_height = H_cam - h_rel
         return absolute_height
     
-    def get_roi(self, img_rgb, img_depth, max_depth=1.5):
+    def get_roi(self, img_rgb, img_depth, max_depth=2.2):
         h, w = img_rgb.shape[:2]
         dist_mask = (img_depth > 0.1) & (img_depth <= max_depth)
         ground_cutoff = int(h * 0.6)
@@ -135,6 +138,28 @@ class RingDetector(Node):
         avg_color = pixels.mean(axis=0)
         return tuple(avg_color.astype(np.uint8).tolist())
 
+    def _classify_allowed_color(self, bgr: tuple[int, int, int]) -> str | None:
+        """Return allowed color name or None for likely false-color detections."""
+        b, g, r = [int(c) for c in bgr]
+        px = np.uint8([[[b, g, r]]])
+        h, s, v = cv2.cvtColor(px, cv2.COLOR_BGR2HSV)[0, 0]
+
+        # Robust black gate: dark + low-to-moderate saturation.
+        if (v <= self.BLACK_MAX_V and s <= self.BLACK_MAX_S) or (v < 55 and s < 140):
+            return 'black'
+
+        # Low-saturation colors (grey/white-ish) are rejected.
+        if s < 50:
+            return None
+
+        if h <= 12 or h >= 168:
+            return 'red'
+        if 40 <= h <= 90:
+            return 'green'
+        if 95 <= h <= 140:
+            return 'blue'
+        return None
+
     def display_detections(self, img_rgb, rings):
         output = img_rgb.copy()
         for ring in rings:
@@ -163,12 +188,25 @@ class RingDetector(Node):
         results = []
         (h, w) = label_map.shape
         unique_labels = np.unique(label_map)
+        hsv_image = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2HSV)
 
         for val in unique_labels:
             if val == 0: continue
             mask = (label_map == val).astype(np.uint8) * 255
 
-            ring_color = self.get_average_color(img_rgb, mask)            
+            ring_color = self.get_average_color(img_rgb, mask)
+            mask_bool = mask > 0
+            if np.any(mask_bool):
+                v_vals = hsv_image[:, :, 2][mask_bool]
+                s_vals = hsv_image[:, :, 1][mask_bool]
+                dark_ratio = float(np.mean(v_vals < 90))
+                sat_med = float(np.median(s_vals))
+                # Promote likely-black blobs before strict color gating.
+                if dark_ratio > 0.45 and sat_med < 95:
+                    ring_color = (0, 0, 0)
+
+            if self._classify_allowed_color(ring_color) is None:
+                continue
 
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -180,7 +218,7 @@ class RingDetector(Node):
                 cx, cy = int(center[0]), int(center[1])
 
                 inertia_ratio = min(axes) / max(axes) if max(axes) != 0 else 0
-                if inertia_ratio < 0.35: continue
+                if inertia_ratio < 0.30: continue
 
                 if 0 <= cy < h and 0 <= cx < w:
                     obj_depths = img_depth[mask > 0]
@@ -193,10 +231,10 @@ class RingDetector(Node):
                     physical_diameter = (pixel_width * avg_ring_depth) / self.fx
 
                     center_depth = img_depth[cy, cx]
-                    is_hollow = not np.isfinite(center_depth) or (center_depth - avg_ring_depth) > 0.15
+                    is_hollow = not np.isfinite(center_depth) or (center_depth - avg_ring_depth) > 0.12
 
                     height = self.estimate_height_from_ground(cy, avg_ring_depth, 240)
-                    if 0.08 < physical_diameter < 0.3 and is_hollow and (0.3 < height < 2.0):
+                    if 0.07 < physical_diameter < 0.32 and is_hollow and (0.25 < height < 2.0):
                         results.append({
                             'ellipse': ellipse,
                             'color': ring_color,
@@ -237,6 +275,8 @@ class RingDetector(Node):
 
     def localize_rings(self, rings, stamp):
         for ring in rings:
+            if self._classify_allowed_color(ring['color']) is None:
+                continue
             (center, axes, angle) = ring['ellipse']
             cx_px, cy_px = center
             depth = ring['depth']
@@ -302,13 +342,13 @@ class RingDetector(Node):
         detector = ObjectDetector()
         label_map = detector.get_labels(
             masked_rgb,
-            downscale_factor=2,
+            downscale_factor=1,
             n_clusters=9,
-            sample_size=5_000,
-            min_area=1500,
-            max_area=7000,
-            morph_kernel_size=5,
-            morph_iterations=2,
+            sample_size=8_000,
+            min_area=800,
+            max_area=8500,
+            morph_kernel_size=3,
+            morph_iterations=1,
         )
         self.display_label_map(label_map)
         rings = self.find_rings(label_map, img_rgb, img_depth)
