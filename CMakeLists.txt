@@ -24,6 +24,7 @@ install(DIRECTORY
   worlds
   maps
   urdf
+  meshes
   DESTINATION share/${PROJECT_NAME}/
 )
 
