@@ -25,15 +25,19 @@ install(DIRECTORY
   maps
   urdf
   meshes
+  personnel
   DESTINATION share/${PROJECT_NAME}/
 )
 
 install(PROGRAMS
   scripts/robot_commander.py
   scripts/detect_people.py
+  scripts/face_recognizer.py
   scripts/task1.py
+  scripts/task2.py
   scripts/detect_rings.py
   scripts/ring_map.py
+  scripts/line_detector.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

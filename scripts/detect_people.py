@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+
 import message_filters
 
 import cv2
 import numpy as np
 import rclpy
 import rclpy.duration
+from ament_index_python.packages import get_package_share_directory
 from rclpy.time import Time
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PointStamped
@@ -13,10 +20,14 @@ from rclpy.node import Node
 from rclpy.qos import QoSReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
-import tf2_geometry_msgs  
+from std_msgs.msg import String
+import tf2_geometry_msgs  # noqa: F401  (registers PointStamped tf transformer)
 import tf2_ros
 from ultralytics import YOLO
 from visualization_msgs.msg import Marker, MarkerArray
+
+sys.path.insert(0, os.path.dirname(__file__))
+from face_recognizer import Identity, PersonnelRecognizer  # noqa: E402
 
 
 class FaceDetector(Node):
@@ -31,13 +42,21 @@ class FaceDetector(Node):
     def __init__(self):
         super().__init__('face_detector')
 
-        self.declare_parameters('', [('device', '')])
+        self.declare_parameters('', [
+            ('device', ''),
+            ('personnel_dir', ''),
+            ('store_path', os.path.expanduser('~/.ros/known_people.json')),
+        ])
         self.device = self.get_parameter('device').get_parameter_value().string_value
+        self.store_path = self.get_parameter('store_path').get_parameter_value().string_value
 
         self.bridge = CvBridge()
 
         self.candidates: list[dict] = []
-        self.confirmed_faces: list[np.ndarray] = []
+        # Each confirmed face is: {'id': int, 'pos': np.ndarray, 'identity': Identity | None,
+        #                          'first_seen': iso8601 str}
+        self.confirmed_faces: list[dict] = []
+        self._next_face_id = 1
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -47,6 +66,8 @@ class FaceDetector(Node):
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.face_cascade_alt2 = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+
+        self.recognizer = self._build_recognizer()
 
         rgb_sub = message_filters.Subscriber(
             self, Image,
@@ -65,15 +86,50 @@ class FaceDetector(Node):
 
         self.marker_pub = self.create_publisher(
             MarkerArray, '/people_markers', QoSReliabilityPolicy.BEST_EFFORT)
+        self.identity_pub = self.create_publisher(
+            String, '/recognized_people', 10)
 
         self.model = YOLO('yolov8n.pt')
+
+        self._load_persisted()
 
         self.get_logger().info(
             'Face detector initialised. '
             f'confidence≥{self.CONFIDENCE_THRESH}, '
             f'depth [{self.MIN_DIST}–{self.MAX_DIST}] m, '
-            f'confirm after {self.CONFIRM_HITS} hits.')
+            f'confirm after {self.CONFIRM_HITS} hits. '
+            f'Personnel known: {len(self.recognizer.people) if self.recognizer else 0}.')
 
+    # ------------------------------------------------------- recognizer setup
+
+    def _build_recognizer(self) -> PersonnelRecognizer | None:
+        personnel_dir = self.get_parameter('personnel_dir').get_parameter_value().string_value
+        if not personnel_dir:
+            try:
+                share = get_package_share_directory('dis_tutorial3')
+                personnel_dir = os.path.join(share, 'personnel')
+            except Exception:
+                personnel_dir = ''
+        if not personnel_dir or not os.path.isdir(personnel_dir):
+            # Last-ditch: source-tree relative to this script.
+            candidate = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'personnel'))
+            if os.path.isdir(candidate):
+                personnel_dir = candidate
+
+        if not personnel_dir or not os.path.isdir(personnel_dir):
+            self.get_logger().warn(
+                'No personnel directory found; running without face recognition.')
+            return None
+
+        try:
+            rec = PersonnelRecognizer(personnel_dir)
+            self.get_logger().info(f'Recogniser trained on {personnel_dir}')
+            return rec
+        except Exception as exc:
+            self.get_logger().warn(f'Recogniser failed to initialise: {exc}')
+            return None
+
+    # ----------------------------------------------------------- main callback
 
     def synced_callback(self, rgb_msg: Image, pc_msg: PointCloud2) -> None:
         try:
@@ -117,9 +173,14 @@ class FaceDetector(Node):
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 180), 1)
                     continue
 
+                identity = self.recognizer.recognize(gray_roi) if self.recognizer else None
+                label_text = (
+                    f'{identity.name} ({identity.role})' if identity is not None
+                    else f'{conf:.2f}'
+                )
                 cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 220, 0), 2)
                 cv2.circle(vis, (cx, cy), 5, (0, 220, 0), -1)
-                cv2.putText(vis, f'{conf:.2f}', (x1, max(y1 - 6, 0)),
+                cv2.putText(vis, label_text, (x1, max(y1 - 6, 0)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
 
                 r = self.DEPTH_SAMPLE_RADIUS
@@ -162,13 +223,13 @@ class FaceDetector(Node):
                     self.get_logger().warn(f'TF transform failed: {exc}')
                     continue
 
-                if any(
-                    np.linalg.norm(pos[:2] - f[:2]) < self.FACE_MIN_SEPARATION
-                    for f in self.confirmed_faces
-                ):
+                # If we already confirmed a face here, keep voting on its identity
+                # (handy when LBPH locks in only after several frames).
+                merged = self._merge_into_confirmed(pos, identity)
+                if merged:
                     continue
 
-                self._update_candidates(pos)
+                self._update_candidates(pos, identity)
 
         self._publish_markers()
 
@@ -190,7 +251,22 @@ class FaceDetector(Node):
             return True
         return len(self.face_cascade_alt2.detectMultiScale(gray_roi, **kwargs)) > 0
 
-    def _update_candidates(self, pos: np.ndarray) -> None:
+    # ------------------------------------------------------ candidate handling
+
+    def _merge_into_confirmed(self, pos: np.ndarray, identity: Identity | None) -> bool:
+        """If *pos* belongs to an already-confirmed face, refine and return True."""
+        for face in self.confirmed_faces:
+            if np.linalg.norm(pos[:2] - face['pos'][:2]) < self.FACE_MIN_SEPARATION:
+                # Smooth position with a low-weight running update.
+                face['pos'] = 0.85 * face['pos'] + 0.15 * pos
+                if identity is not None:
+                    votes = face.setdefault('votes', {})
+                    votes[identity.label_id] = votes.get(identity.label_id, 0.0) + identity.score
+                    self._refresh_identity(face)
+                return True
+        return False
+
+    def _update_candidates(self, pos: np.ndarray, identity: Identity | None) -> None:
         best_idx: int | None = None
         best_dist = self.CANDIDATE_RADIUS
 
@@ -204,16 +280,133 @@ class FaceDetector(Node):
             n = cand['count']
             cand['pos']   = (cand['pos'] * n + pos) / (n + 1)
             cand['count'] += 1
+            if identity is not None:
+                cand['votes'][identity.label_id] = (
+                    cand['votes'].get(identity.label_id, 0.0) + identity.score)
 
             if cand['count'] >= self.CONFIRM_HITS:
-                face_id = len(self.confirmed_faces) + 1
+                face_id = self._next_face_id
+                self._next_face_id += 1
+                face = {
+                    'id': face_id,
+                    'pos': cand['pos'].copy(),
+                    'votes': dict(cand['votes']),
+                    'identity': None,
+                    'first_seen': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                }
+                self._refresh_identity(face)
+                ident_str = (
+                    f'{face["identity"].name} ({face["identity"].role})'
+                    if face['identity'] else 'unknown'
+                )
                 self.get_logger().info(
                     f'Face #{face_id} confirmed at '
-                    f'({cand["pos"][0]:.2f}, {cand["pos"][1]:.2f}) m')
-                self.confirmed_faces.append(cand['pos'].copy())
+                    f'({face["pos"][0]:.2f}, {face["pos"][1]:.2f}) m – {ident_str}')
+                self.confirmed_faces.append(face)
                 self.candidates.pop(best_idx)
+                self._persist_and_publish()
         else:
-            self.candidates.append({'pos': pos.copy(), 'count': 1})
+            cand = {'pos': pos.copy(), 'count': 1, 'votes': {}}
+            if identity is not None:
+                cand['votes'][identity.label_id] = identity.score
+            self.candidates.append(cand)
+
+    def _refresh_identity(self, face: dict) -> None:
+        """Pick the highest-voted label for *face* and update its `identity`."""
+        votes: dict[int, float] = face.get('votes', {})
+        if not votes or self.recognizer is None:
+            return
+        best_label = max(votes, key=lambda k: votes[k])
+        meta = self.recognizer.people.get(best_label)
+        if meta is None:
+            return
+        previous = face.get('identity')
+        face['identity'] = Identity(
+            label_id=best_label,
+            name=meta['name'],
+            role=meta['role'],
+            gender=meta['gender'],
+            score=float(votes[best_label] / max(1, sum(votes.values()))),
+        )
+        if previous is None or previous.label_id != best_label:
+            self._persist_and_publish()
+
+    # --------------------------------------------------------- persistence
+
+    def _load_persisted(self) -> None:
+        if not self.store_path or not os.path.exists(self.store_path):
+            return
+        try:
+            with open(self.store_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            self.get_logger().warn(f'Could not read {self.store_path}: {exc}')
+            return
+
+        for entry in data.get('faces', []):
+            ident = None
+            if entry.get('name') and self.recognizer is not None:
+                # Look up label_id by name so future votes still merge.
+                for lbl, meta in self.recognizer.people.items():
+                    if meta['name'] == entry['name'] and meta['role'] == entry.get('role'):
+                        ident = Identity(
+                            label_id=lbl,
+                            name=meta['name'],
+                            role=meta['role'],
+                            gender=meta['gender'],
+                            score=float(entry.get('score', 0.0)),
+                        )
+                        break
+            face = {
+                'id': int(entry['id']),
+                'pos': np.array([entry['x'], entry['y'], entry.get('z', 0.0)]),
+                'votes': {} if ident is None else {ident.label_id: ident.score},
+                'identity': ident,
+                'first_seen': entry.get('first_seen',
+                                        datetime.now(timezone.utc).isoformat(timespec='seconds')),
+            }
+            self.confirmed_faces.append(face)
+            self._next_face_id = max(self._next_face_id, face['id'] + 1)
+
+        if self.confirmed_faces:
+            self.get_logger().info(
+                f'Restored {len(self.confirmed_faces)} known faces from {self.store_path}')
+
+    def _persist_and_publish(self) -> None:
+        payload = {
+            'faces': [
+                {
+                    'id': f['id'],
+                    'name': f['identity'].name if f['identity'] else None,
+                    'role': f['identity'].role if f['identity'] else None,
+                    'gender': f['identity'].gender if f['identity'] else None,
+                    'score': float(f['identity'].score) if f['identity'] else 0.0,
+                    'x': float(f['pos'][0]),
+                    'y': float(f['pos'][1]),
+                    'z': float(f['pos'][2]),
+                    'first_seen': f['first_seen'],
+                }
+                for f in self.confirmed_faces
+            ]
+        }
+        text = json.dumps(payload, indent=2)
+
+        msg = String()
+        msg.data = text
+        self.identity_pub.publish(msg)
+
+        if not self.store_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.store_path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix='.known_people-', dir=os.path.dirname(self.store_path))
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(text)
+            os.replace(tmp, self.store_path)
+        except Exception as exc:
+            self.get_logger().warn(f'Could not write {self.store_path}: {exc}')
+
+    # ---------------------------------------------------------------- markers
 
     def _publish_markers(self) -> None:
         if not self.confirmed_faces:
@@ -222,7 +415,20 @@ class FaceDetector(Node):
         now = self.get_clock().now().to_msg()
         ma  = MarkerArray()
 
-        for i, pos in enumerate(self.confirmed_faces):
+        for face in self.confirmed_faces:
+            i = face['id']
+            pos = face['pos']
+            ident = face['identity']
+            label = (f'{ident.name} ({ident.role})'
+                     if ident is not None else f'Face {i}')
+            # Pink for she/her, cyan for he/him, neutral orange when unknown.
+            if ident is None:
+                colour = (1.0, 0.4, 0.0)
+            elif ident.gender == 'female':
+                colour = (1.0, 0.45, 0.75)
+            else:
+                colour = (0.0, 0.7, 1.0)
+
             sphere = Marker()
             sphere.header.frame_id = 'map'
             sphere.header.stamp = now
@@ -235,28 +441,48 @@ class FaceDetector(Node):
             sphere.pose.position.z = float(pos[2])
             sphere.pose.orientation.w = 1.0
             sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.3
-            sphere.color.r = 1.0
-            sphere.color.g = 0.4
-            sphere.color.b = 0.0
+            sphere.color.r, sphere.color.g, sphere.color.b = colour
             sphere.color.a = 1.0
             ma.markers.append(sphere)
 
-            label = Marker()
-            label.header.frame_id = 'map'
-            label.header.stamp = now
-            label.ns = 'face_labels'
-            label.id = i
-            label.type = Marker.TEXT_VIEW_FACING
-            label.action = Marker.ADD
-            label.pose.position.x = float(pos[0])
-            label.pose.position.y = float(pos[1])
-            label.pose.position.z = float(pos[2]) + 0.45
-            label.pose.orientation.w = 1.0
-            label.scale.z = 0.22
-            label.color.r = label.color.g = label.color.b = 1.0
-            label.color.a = 1.0
-            label.text = f'Face {i + 1}'
-            ma.markers.append(label)
+            text_marker = Marker()
+            text_marker.header.frame_id = 'map'
+            text_marker.header.stamp = now
+            text_marker.ns = 'face_labels'
+            text_marker.id = i
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose.position.x = float(pos[0])
+            text_marker.pose.position.y = float(pos[1])
+            text_marker.pose.position.z = float(pos[2]) + 0.45
+            text_marker.pose.orientation.w = 1.0
+            text_marker.scale.z = 0.22
+            text_marker.color.r = text_marker.color.g = text_marker.color.b = 1.0
+            text_marker.color.a = 1.0
+            text_marker.text = label
+            ma.markers.append(text_marker)
+
+            # Machine-readable identity marker, JSON-encoded.
+            meta_marker = Marker()
+            meta_marker.header.frame_id = 'map'
+            meta_marker.header.stamp = now
+            meta_marker.ns = 'face_identities'
+            meta_marker.id = i
+            meta_marker.type = Marker.TEXT_VIEW_FACING
+            meta_marker.action = Marker.ADD
+            meta_marker.pose.position.x = float(pos[0])
+            meta_marker.pose.position.y = float(pos[1])
+            meta_marker.pose.position.z = float(pos[2]) + 0.7
+            meta_marker.pose.orientation.w = 1.0
+            meta_marker.scale.z = 0.001  # invisible by default; data is in `text`
+            meta_marker.color.a = 0.0
+            meta_marker.text = json.dumps({
+                'id': i,
+                'name': ident.name if ident else None,
+                'role': ident.role if ident else None,
+                'gender': ident.gender if ident else None,
+            })
+            ma.markers.append(meta_marker)
 
         self.marker_pub.publish(ma)
 

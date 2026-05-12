@@ -33,7 +33,8 @@ ARGUMENTS = [
     DeclareLaunchArgument('rviz', default_value='false',choices=['true', 'false'],description='Start rviz.'),
     DeclareLaunchArgument('use_sim_time', default_value='true',choices=['true', 'false'],description='use_sim_time'),
     DeclareLaunchArgument('model', default_value='standard',choices=['standard', 'lite'],description='Turtlebot4 Model'),
-    DeclareLaunchArgument('namespace', default_value='', description='Robot namespace')
+    DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
+    DeclareLaunchArgument('world', default_value='warehouse', description='Gazebo world name (used to build sensor topic paths in the bridge)'),
 ]
 
 for pose_element in ['x', 'y', 'z', 'yaw']:
@@ -52,7 +53,9 @@ def generate_launch_description():
     pkg_irobot_create_gz_bringup = get_package_share_directory('irobot_create_gz_bringup')
 
     # Paths
-    turtlebot4_ros_gz_bridge_launch = PathJoinSubstitution([pkg_turtlebot4_gz_bringup, 'launch', 'ros_gz_bridge.launch.py'])
+    # Use the LOCAL bridge (dis_tutorial3) — adds the top_camera bridge that the
+    # external turtlebot4_gz_bringup version is missing.
+    turtlebot4_ros_gz_bridge_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'ros_gz_bridge.launch.py'])
     rviz_launch = PathJoinSubstitution([pkg_turtlebot4_viz, 'launch', 'view_navigation.launch.py'])
     turtlebot4_node_launch = PathJoinSubstitution([pkg_turtlebot4_gz_bringup, 'launch', 'turtlebot4_nodes.launch.py'])
     create3_nodes_launch = PathJoinSubstitution([pkg_irobot_create_common_bringup, 'launch', 'create3_nodes.launch.py'])
@@ -108,7 +111,9 @@ def generate_launch_description():
             launch_arguments=[
                 ('model', LaunchConfiguration('model')),
                 ('robot_name', robot_name),
-                ('namespace', namespace)
+                ('namespace', namespace),
+                ('world', LaunchConfiguration('world')),
+                ('use_sim_time', LaunchConfiguration('use_sim_time')),
             ]
         ),
 

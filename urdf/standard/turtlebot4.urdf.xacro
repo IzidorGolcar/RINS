@@ -1,13 +1,16 @@
 <?xml version="1.0" ?>
 <robot name="turtlebot4" xmlns:xacro="http://ros.org/wiki/xacro">
   <!-- Base create3 model -->
-  <xacro:include filename="$(find irobot_create_description)/urdf/create3.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/rplidar.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/oakd.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/camera_bracket.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial3)/urdf/standard/tower_standoff.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial3)/urdf/standard/tower_sensor_plate.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial3)/urdf/standard/weight_block.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/create/create3.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/rplidar.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/oakd.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/top_camera.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/camera_bracket.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/standard/tower_standoff.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/standard/tower_sensor_plate.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/standard/weight_block.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial7)/urdf/arm/arm.urdf.xacro" />
+
 
   <!-- Mechanical properties -->
   <xacro:property name="shell_z_offset"                value="${3*cm2m}" />
@@ -123,13 +126,27 @@
   <xacro:oakd model="pro" parent_link="oakd_camera_bracket">
     <origin xyz="${oakd_pro_x_offset} ${oakd_pro_y_offset} ${oakd_pro_z_offset}"/>
   </xacro:oakd>
+ 
+  <xacro:simple_arm parent_link="tower_sensor_plate">
+    <origin xyz="0 0 0.01"
+            rpy="0 0 0"/>
+  </xacro:simple_arm>
 
-  <!-- Base footprint for navigation -->
-  <link name="base_footprint" />
-  <joint name="base_footprint_joint" type="fixed">
-    <!-- Create3's base_link is already on the ground -->
-    <origin xyz="0 0 0" rpy="0 0 0" />
-    <parent link="base_link" />
-    <child link="base_footprint" />
-  </joint>
+  <xacro:top_camera name="top_camera" model="pro" parent_link="arm_wrist_link">
+    <origin xyz="0 0 0.065" rpy="0 -${pi/2} 0"/>
+  </xacro:top_camera>
+
+    <gazebo>
+      <plugin filename="libign_ros2_control-system.so" name="ign_ros2_control::IgnitionROS2ControlPlugin">
+        <parameters>$(find dis_tutorial7)/config/all_controls_jtc.yaml</parameters>
+        <ros>
+          <remapping>~/odom:=odom</remapping>
+          <remapping>/tf:=tf</remapping>
+          <remapping>/tf_static:=tf_static</remapping>
+          <remapping>/diagnostics:=diagnostics</remapping>
+          <namespace>$(arg namespace)</namespace>
+        </ros>
+      </plugin>
+    </gazebo>
+  
 </robot>

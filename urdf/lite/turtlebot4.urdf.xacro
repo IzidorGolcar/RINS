@@ -33,13 +33,4 @@
   <xacro:oakd model="lite" parent_link="oakd_camera_bracket">
     <origin xyz="${oakd_lite_x_offset} ${oakd_lite_y_offset} ${oakd_lite_z_offset}"/>
   </xacro:oakd>
-
-  <!-- Base footprint for navigation -->
-  <link name="base_footprint" />
-  <joint name="base_footprint_joint" type="fixed">
-    <!-- Create3's base_link is already on the ground -->
-    <origin xyz="0 0 0" rpy="0 0 0" />
-    <parent link="base_link" />
-    <child link="base_footprint" />
-  </joint>
 </robot>

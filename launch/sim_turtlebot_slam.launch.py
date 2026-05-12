@@ -57,6 +57,7 @@ def generate_launch_description():
         launch_arguments=[
             ('namespace', LaunchConfiguration('namespace')),
             ('rviz', LaunchConfiguration('rviz')),
+            ('world', LaunchConfiguration('world')),
             ('x', LaunchConfiguration('x')),
             ('y', LaunchConfiguration('y')),
             ('z', LaunchConfiguration('z')),
