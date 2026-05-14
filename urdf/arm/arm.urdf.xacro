@@ -140,7 +140,7 @@
 
   <ros2_control name="arm_controller_hw" type="system">
     <hardware>
-      <plugin>ign_ros2_control/IgnitionSystem</plugin>
+      <plugin>gz_ros2_control/GazeboSimSystem</plugin>
     </hardware>
     <joint name="arm_base_joint">
       <command_interface name="position"/>
