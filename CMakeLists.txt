@@ -38,6 +38,7 @@ install(PROGRAMS
   scripts/detect_rings.py
   scripts/ring_map.py
   scripts/line_detector.py
+  scripts/arm_mover_actions.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

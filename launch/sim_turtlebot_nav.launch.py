@@ -42,6 +42,7 @@ def generate_launch_description():
     robot_spawn_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'turtlebot4_spawn.launch.py'])
     localization_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'localization.launch.py'])
     nav2_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'nav2.launch.py'])
+    control_launch = PathJoinSubstitution([pkg_dis_tutorial3, 'launch', 'control.launch.py'])
 
     #Simulator and world
     gazebo = IncludeLaunchDescription(
@@ -86,11 +87,20 @@ def generate_launch_description():
         ]
     )
 
+    # Controller spawner (loads arm_controller, diffdrive controller, etc.)
+    control = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([control_launch]),
+        launch_arguments=[
+            ('namespace', LaunchConfiguration('namespace'))
+        ]
+    )
+
 
     # Create launch description and add actions
     ld = LaunchDescription(ARGUMENTS)
     ld.add_action(gazebo)
     ld.add_action(robot_spawn)
     ld.add_action(localization)
+    ld.add_action(control)
     ld.add_action(nav2)
     return ld
