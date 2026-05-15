@@ -10,7 +10,7 @@ from rclpy.time import Time
 import cv2
 import numpy as np
 
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, JointState
 from cv_bridge import CvBridgeError, CvBridge
 from geometry_msgs.msg import PointStamped
 from rclpy.qos import qos_profile_sensor_data
@@ -19,7 +19,6 @@ import tf2_geometry_msgs  # noqa: F401  (registers PointStamped tf transformer)
 import tf2_ros
 from util import *
 from segmentation_model import SegmentationModel
-from nav_msgs.msg import Odometry
 
 @dataclass
 class Tile:
@@ -47,7 +46,7 @@ class AnomalyDetector(Node):
         self.camera_sub = self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self.camera_frame_callback, qos_profile_sensor_data)
         self.depth_sub = self.create_subscription(Image, "/top_camera/rgb/preview/depth", self.depth_callback, qos_profile_sensor_data)
         self.camera_info_sub = self.create_subscription(CameraInfo, "/top_camera/rgb/preview/camera_info", self.camera_info_callback, qos_profile_sensor_data)
-        self.odom_sub = self.create_subscription(Odometry, "/odom", self.odom_callback, qos_profile_sensor_data)
+        self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, qos_profile_sensor_data)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -60,16 +59,16 @@ class AnomalyDetector(Node):
         self._latest_camera_frame = None
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
+        self._arm_joint_positions: dict[str, float] = {}
+        self._arm_prev_joint_positions: dict[str, float] = {}
+        self._arm_stable_samples = 0
+        self._arm_is_moving = True
 
         self.tile_marker_pub = self.create_publisher(MarkerArray, '/tile_markers', 10)
 
         cv2.namedWindow('Tile Detections', cv2.WINDOW_NORMAL)
-        cv2.namedWindow('utility', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Tiles', cv2.WINDOW_NORMAL)
 
-
-    def odom_callback(self, msg):
-        position = msg.pose.pose.position
-        orientation = msg.pose.pose.orientation
 
     def camera_info_callback(self, msg):
         if self.fx is not None:
@@ -101,7 +100,45 @@ class AnomalyDetector(Node):
         self._latest_depth_frame = msg.header.frame_id
         self._latest_depth_stamp = msg.header.stamp
 
-        
+    def joint_state_callback(self, msg):
+        arm_joint_names = {
+            'arm_base_joint',
+            'arm_shoulder_joint',
+            'arm_elbow_joint',
+            'arm_wrist_joint',
+        }
+
+        joint_positions = {
+            name: position
+            for name, position in zip(msg.name, msg.position)
+            if name in arm_joint_names
+        }
+
+        if len(joint_positions) != len(arm_joint_names):
+            return
+
+        if not self._arm_joint_positions:
+            self._arm_joint_positions = joint_positions
+            self._arm_prev_joint_positions = joint_positions.copy()
+            self._arm_stable_samples = 0
+            self._arm_is_moving = True
+            return
+
+        max_delta = max(
+            abs(joint_positions[name] - self._arm_joint_positions[name])
+            for name in arm_joint_names
+        )
+
+        self._arm_prev_joint_positions = self._arm_joint_positions.copy()
+        self._arm_joint_positions = joint_positions
+
+        if max_delta < 0.01:
+            self._arm_stable_samples += 1
+        else:
+            self._arm_stable_samples = 0
+
+        self._arm_is_moving = self._arm_stable_samples < 10
+
     def camera_frame_callback(self, msg):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -115,11 +152,8 @@ class AnomalyDetector(Node):
         
         cv2.waitKey(1)
 
-    def detect_anomalies(self, cv_image):
-        self.detect_tiles(cv_image)
-
     def _sample_tile_position(self, quad, mask):
-        if self._latest_depth is None or self.fx is None:
+        if self._latest_depth is None or self.fx is None or self._arm_is_moving:
             return None
 
         depth_h, depth_w = self._latest_depth.shape[:2]
@@ -222,7 +256,7 @@ class AnomalyDetector(Node):
         if marker_array.markers:
             self.tile_marker_pub.publish(marker_array)
 
-    def detect_tiles(self, cv_image):
+    def detect_anomalies(self, cv_image):
         mask, quad = generate_tile_mask(cv_image)
         
         if quad is None:
@@ -257,22 +291,12 @@ class AnomalyDetector(Node):
             else:
                 cv2.putText(tile_display, 'No Anomaly', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-            if tile.position is not None:
-                cv2.putText(
-                    detections,
-                    f"map x={tile.position[0]:.2f} y={tile.position[1]:.2f}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2,
-                )
 
         else:
             cv2.polylines(detections, [quad], isClosed=True, color=(0, 0, 255), thickness=3)
             tile_display = np.zeros((304, 304, 3), dtype=np.uint8)         
 
-        cv2.imshow('utility', tile_display)
+        cv2.imshow('Tiles', tile_display)
         cv2.imshow('Tile Detections', detections)
         self._publish_tile_markers()
         
