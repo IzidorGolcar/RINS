@@ -80,3 +80,18 @@ def rectify_tile(
     H, _ = cv2.findHomography(pts, dst)
     warped = cv2.warpPerspective(image, H, (output_size, output_size))
     return warped
+
+
+def tile_phash(rectified: np.ndarray, hash_size: int = 16) -> np.ndarray:
+    dct_size = hash_size * 4
+    gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (dct_size, dct_size), interpolation=cv2.INTER_AREA)
+    dct = cv2.dct(small.astype(np.float32))
+    low_freq = dct[:hash_size, :hash_size]
+    return low_freq > np.median(low_freq)
+
+
+def tiles_are_same(hash_a: np.ndarray, hash_b: np.ndarray, threshold: float = 0.20) -> bool:
+    hamming = np.count_nonzero(hash_a != hash_b)
+    return (hamming / hash_a.size) < threshold
+
