@@ -14,7 +14,15 @@ class SegmentationModel:
     
     def predict(self, tile_image):
         input_array = tile_image.astype(np.float32) / 255.0
+
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        input_array = (input_array - mean) / std
+
         input_tensor = torch.from_numpy(input_array).permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+
+
         with torch.no_grad():
             logit = self.model(input_tensor)
             prob = torch.sigmoid(logit).squeeze().cpu()

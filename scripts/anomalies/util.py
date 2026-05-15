@@ -68,7 +68,8 @@ def is_tile_fully_visible(
 def rectify_tile(
     image: np.ndarray,
     quad: np.ndarray,
-    output_size: int = 512,
+    output_size: int = 312,
+    n: int = 4,
 ) -> np.ndarray:
     pts = quad.reshape(4, 2).astype(np.float32)
     center = pts.mean(axis=0)
@@ -79,8 +80,7 @@ def rectify_tile(
     dst = np.array([[0, 0], [s, 0], [s, s], [0, s]], dtype=np.float32)
     H, _ = cv2.findHomography(pts, dst)
     warped = cv2.warpPerspective(image, H, (output_size, output_size))
-    return warped
-
+    return warped[n:-n, n:-n] if n > 0 else warped
 
 def tile_phash(rectified: np.ndarray, hash_size: int = 16) -> np.ndarray:
     dct_size = hash_size * 4
