@@ -12,7 +12,7 @@ DEFAULT_HSV = {
     "red":    (( 0,  100, 100),       (179, 255, 255)),
 }
 
-def _line_mask(depth_image, rgb_image, ground_mask):
+def line_mask(depth_image, rgb_image, ground_mask):
     """Segment colored lines (yellow, red, green, blue) on the ground plane.
     Returns multiclass labels: 0=background, 1=yellow, 2=red, 3=blue, 4=green.
     """
@@ -87,7 +87,7 @@ def _line_mask(depth_image, rgb_image, ground_mask):
     return line_labels
 
 
-def _ground_mask(
+def ground_mask(
         depth_image,
         fx, fy, cx, cy,
         ground_distance_threshold=0.05,
