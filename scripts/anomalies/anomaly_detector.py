@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 
+import os
+
 from attr import dataclass
 import torch
 
@@ -19,6 +21,9 @@ import tf2_geometry_msgs  # noqa: F401  (registers PointStamped tf transformer)
 import tf2_ros
 from util import *
 from segmentation_model import SegmentationModel
+
+from ament_index_python.packages import get_package_share_directory
+import os
 
 @dataclass
 class Tile:
@@ -51,7 +56,10 @@ class AnomalyDetector(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.segmentation_model = SegmentationModel("/home/izidor/ros2_ws/anomaly_detector_2.pt", device="cpu")
+        pkg_dir = get_package_share_directory('dis_tutorial3')
+        model_path = os.path.join(pkg_dir, 'models', 'anomaly_detector.pt')
+
+        self.segmentation_model = SegmentationModel(model_path, device="cpu")
         self.tiles = []
         self._latest_depth = None
         self._latest_depth_frame = None

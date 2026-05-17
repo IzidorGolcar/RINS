@@ -29,6 +29,10 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/
 )
 
+install(DIRECTORY models/
+    DESTINATION share/${PROJECT_NAME}/models
+)
+
 # Ni treba vsakega fajla posebej dodajat!!!
 file(GLOB_RECURSE SCRIPT_FILES CONFIGURE_DEPENDS "scripts/*.py")
 install(PROGRAMS ${SCRIPT_FILES} DESTINATION lib/${PROJECT_NAME})
