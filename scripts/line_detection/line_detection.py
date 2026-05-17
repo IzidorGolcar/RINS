@@ -33,8 +33,8 @@ DEFAULT_HSV = {
     #         (H_low, S_low, V_low)   (H_high, S_high, V_high)
     "yellow": ((20,  100, 100),       (35,  255, 255)),
     "green":  ((40,   80,  80),       (80,  255, 255)),
-    "red_lo": (( 0,  120, 120),       (10,  255, 255)),  # red wraps around 0°
-    "red_hi": ((170, 120, 120),       (179, 255, 255)),  # upper red segment
+    "blue":   ((90,   20,  20),       (135, 255, 255)),
+    "red":    (( 0,  100, 100),       (179, 255, 255)),  # both lower and upper hue wrapped
 }
 
 class LineDetector(Node):
@@ -63,7 +63,7 @@ class LineDetector(Node):
             self.cam_info_callback,
             QoSProfile(depth=1)
         )
-        cv2.namedWindow('Overlay', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Lines', cv2.WINDOW_NORMAL)
 
 
     def stream_callback(self, rgb_msg, depth_msg):
@@ -90,32 +90,21 @@ class LineDetector(Node):
                     m = m[:, :, 0]
                 m = (m > 0).astype(np.uint8)
 
-                # create a colored mask (green)
-                colored = np.zeros_like(rgb_display)
-                colored[:, :] = (0, 255, 0)
-
-                alpha = 0.4
-                blended = cv2.addWeighted(rgb_display.astype(np.uint8), 1.0, colored, alpha, 0)
-
-                # apply blended only where mask is set
                 mask3 = np.repeat(m[:, :, None], 3, axis=2).astype(bool)
-                overlay = rgb_display.copy()
-                overlay[mask3] = blended[mask3]
 
-                cv2.imshow('Overlay', overlay)
                 
                 # Detect and display lines on ground
                 line_labels = self._line_mask(depth_for_processing, rgb_display, mask)
                 if line_labels is not None and line_labels.max() > 0:
-                    # Create line overlay with different colors per class
-                    line_overlay = overlay.copy()
+                    line_overlay = rgb_display.clip(0, 255).astype(np.uint8)
+                    line_overlay[m > 0] = 0
                     
                     # Color map: class -> BGR color
                     color_map = {
-                        1: (255, 255, 0),    # cyan (yellow)
-                        2: (0, 0, 255),      # red (red_lo)
-                        3: (0, 0, 255),      # red (red_hi)
-                        4: (0, 255, 0),      # green
+                        1: (0, 200, 200),    # yellow in BGR
+                        2: (0, 0, 200),      # red in BGR
+                        3: (200, 0, 0),      # blue in BGR
+                        4: (0, 200, 0),      # green in BGR
                     }
                     
                     for class_id, line_color in color_map.items():
@@ -125,14 +114,18 @@ class LineDetector(Node):
                     
                     cv2.imshow('Lines', line_overlay)
                 else:
-                    cv2.imshow('Lines', overlay)
+                    line_overlay = (rgb_display.astype(np.float32) * 0.20).clip(0, 255).astype(np.uint8)
+                    white_tint = np.full_like(rgb_display, 255)
+                    line_ground = cv2.addWeighted(line_overlay, 1.0, white_tint, 0.35, 0)
+                    line_overlay[mask3] = line_ground[mask3]
+                    cv2.imshow('Lines', line_overlay)
 
         cv2.waitKey(1)
 
 
     def _line_mask(self, depth_image, rgb_image, ground_mask):
-        """Segment colored lines (yellow, red, green) on the ground plane.
-        Returns multiclass labels: 0=background, 1=yellow, 2=red_lo, 3=red_hi, 4=green.
+        """Segment colored lines (yellow, red, green, blue) on the ground plane.
+        Returns multiclass labels: 0=background, 1=yellow, 2=red, 3=blue, 4=green.
         """
         if ground_mask is None:
             return None
@@ -149,22 +142,60 @@ class LineDetector(Node):
         ground_binary = (ground_mask > 0).astype(np.uint8)
         
         # Create multiclass labels for each color
-        color_class_map = {'yellow': 1, 'red_lo': 2, 'red_hi': 3, 'green': 4}
+        color_class_map = {'yellow': 1, 'red': 2, 'blue': 3, 'green': 4}
+        class_colors = {
+            1: (255, 255, 0),
+            2: (0, 0, 255),
+            3: (255, 0, 0),
+            4: (0, 255, 0),
+        }
         
         for color_name, class_id in color_class_map.items():
             if color_name not in DEFAULT_HSV:
                 continue
-            hsv_lo, hsv_hi = DEFAULT_HSV[color_name]
-            color_mask = cv2.inRange(hsv_image, np.array(hsv_lo), np.array(hsv_hi))
+            
+            color_mask = np.zeros((h, w), dtype=np.uint8)
+            
+            # Special handling for red which wraps around hue
+            if color_name == 'red':
+                # Red in HSV wraps: 0-10 and 170-179
+                red_lo = cv2.inRange(hsv_image, np.array((0, 100, 100)), np.array((10, 255, 255)))
+                red_hi = cv2.inRange(hsv_image, np.array((170, 100, 100)), np.array((179, 255, 255)))
+                color_mask = cv2.bitwise_or(red_lo, red_hi)
+            else:
+                hsv_lo, hsv_hi = DEFAULT_HSV[color_name]
+                color_mask = cv2.inRange(hsv_image, np.array(hsv_lo), np.array(hsv_hi))
+            
             # Apply to ground region only
             color_mask = cv2.bitwise_and(color_mask, ground_binary)
+            # Remove speckle noise before labeling
+            try:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+                color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+                color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
+            except Exception:
+                pass
+
+            num_labels, cc_labels, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+            filtered = np.zeros((h, w), dtype=np.uint8)
+
+            for label_id in range(1, num_labels):
+                area = stats[label_id, cv2.CC_STAT_AREA]
+                width = stats[label_id, cv2.CC_STAT_WIDTH]
+                height = stats[label_id, cv2.CC_STAT_HEIGHT]
+                aspect_ratio = max(width, height) / max(min(width, height), 1)
+
+                # Keep thin, elongated components that are large enough to be real floor lines.
+                if area < 20:
+                    continue
+                if area < 40 and aspect_ratio < 1.6:
+                    continue
+
+                component_mask = (cc_labels == label_id)
+                filtered[component_mask] = 255
+
             # Assign class label where mask is positive
-            line_labels[color_mask > 0] = class_id
-        
-        # Visualize raw multiclass labels (apply colormap)
-        if line_labels.max() > 0:
-            label_vis = cv2.applyColorMap((line_labels.astype(np.uint8) * 60).clip(0, 255), cv2.COLORMAP_JET)
-            cv2.imshow('Lines Raw', label_vis)
+            line_labels[filtered > 0] = class_id
         
         return line_labels
 
