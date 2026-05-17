@@ -142,7 +142,7 @@ global_costmap:
                   [ 0.134,  0.134]]"
       resolution: 0.06
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "yellow_line_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -174,6 +174,24 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
         inflation_radius: 0.45
+
+      yellow_line_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: yellow_line
+        yellow_line:
+          topic: /line_detector/yellow_obstacle
+          sensor_frame: map
+          data_type: PointCloud2
+          marking: true
+          clearing: true          # clears when line moves out of view
+          max_obstacle_height: 1.0
+          min_obstacle_height: -0.1
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+
       always_send_full_costmap: true
 
 planner_server:

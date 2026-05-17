@@ -273,8 +273,6 @@ class LineDetector(Node):
         self.pc_pub.publish(self._make_pointcloud2(xyz, rgb, stamp))
 
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
-
     def _transform_to_matrix(self, t, q):
         """Quaternion + translation → 4×4 homogeneous transform matrix."""
         x, y, z, w = q.x, q.y, q.z, q.w
