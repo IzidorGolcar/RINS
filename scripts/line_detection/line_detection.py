@@ -43,6 +43,9 @@ class LineDetector(Node):
         super().__init__("line_detection")
 
         self.bridge = CvBridge()
+        self.ground_distance_threshold = 0.0001
+        self.ground_min_normal_y = 0.55
+        self.ground_min_y_over_z = 1.1
     
         self.rgb_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/image_raw")
         self.depth_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/depth")
@@ -75,14 +78,10 @@ class LineDetector(Node):
         rgb_display = rgb_image.copy()
         depth_for_processing = depth_image.copy()
 
-        if not self.received_camera_info:
-            # show blank until intrinsics are available
-            cv2.imshow('Overlay', rgb_display)
-        else:
+        if self.received_camera_info:
             mask = self._ground_mask(depth_for_processing)
             # ensure mask is single channel uint8 with values 0 or 255
             if mask is None:
-                cv2.imshow('Overlay', rgb_display)
                 cv2.imshow('Lines',   rgb_display)
             else:
                 m = mask.copy()
@@ -114,10 +113,8 @@ class LineDetector(Node):
                     
                     cv2.imshow('Lines', line_overlay)
                 else:
-                    line_overlay = (rgb_display.astype(np.float32) * 0.20).clip(0, 255).astype(np.uint8)
-                    white_tint = np.full_like(rgb_display, 255)
-                    line_ground = cv2.addWeighted(line_overlay, 1.0, white_tint, 0.35, 0)
-                    line_overlay[mask3] = line_ground[mask3]
+                    line_overlay = rgb_display.clip(0, 255).astype(np.uint8)
+                    line_overlay[m > 0] = 0
                     cv2.imshow('Lines', line_overlay)
 
         cv2.waitKey(1)
@@ -255,7 +252,7 @@ class LineDetector(Node):
         best_inliers = None
         best_plane = None
         iterations = 300
-        distance_threshold = 0.0001  # meters
+        distance_threshold = self.ground_distance_threshold  # meters
         rng = np.random.default_rng()
         N = pts_sample.shape[0]
         if N < 3:
@@ -275,6 +272,15 @@ class LineDetector(Node):
             if norm < 1e-6:
                 continue
             normal = normal / norm
+
+            # Reject planes that do not look like a floor in the camera optical frame.
+            normal_y = abs(float(normal[1]))
+            normal_z = abs(float(normal[2]))
+            if normal_y < self.ground_min_normal_y:
+                continue
+            if normal_z > 1e-6 and (normal_y / normal_z) < self.ground_min_y_over_z:
+                continue
+
             d = -np.dot(normal, p1)
 
             # distances of all sampled pts to plane
