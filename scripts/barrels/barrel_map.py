@@ -16,7 +16,7 @@ import numpy as np
 
 # Constants used by the tracker. See plan for rationale.
 MERGE_DIST = 0.45     # m (prevent side-by-side barrels from merging)
-CONFIRM_OBS = 6
+CONFIRM_OBS = 12
 CONFIRM_TRACE = 0.20
 
 # Outlier gate: chi-squared 3 DoF, p=0.05
