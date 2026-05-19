@@ -440,8 +440,8 @@ class BarrelDetector(Node):
             return None
 
         # Ensure the barrel is resting on the floor (reject high ring stand and conveyor)
-        if not (-0.15 <= ground_anchor[2] <= 0.25):
-            self.get_logger().info(f"-> Rejected {cand['colour']}: Ground anchor Z {ground_anchor[2]:.2f} out of [-0.15, 0.25]")
+        if not (-0.15 <= ground_anchor[2] <= 0.12):
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Ground anchor Z {ground_anchor[2]:.2f} out of [-0.15, 0.12]")
             return None
 
         # Restrict to first room only (X < 4.5)
@@ -461,11 +461,11 @@ class BarrelDetector(Node):
 
         # Discovery vs update.
         if not cfg.discovery:
-            nearest = self.barrel_map.nearest_landmark(centroid, max_dist=1.0)
+            nearest = self.barrel_map.nearest_landmark(centroid, cand['colour'], max_dist=1.0)
             if nearest is None:
                 return None
 
-        lm = self.barrel_map.update(centroid, cand['colour'], orientation, ground_anchor)
+        lm = self.barrel_map.update(centroid, cand['colour'], orientation, ground_anchor, camera_id=cam_key)
         if lm is None:
             return None
 
@@ -588,14 +588,32 @@ class BarrelDetector(Node):
     # ----------------------------------------------------------------- output
 
     def _show_debug(self, cam_key: str, rgb: np.ndarray, candidates: list) -> None:
-        vis = rgb.copy()
+        if not hasattr(self, '_vis_history'):
+            self._vis_history = {'oakd': {}, 'top': {}}
+
+        # Decrement decay counter for existing items
+        history = self._vis_history[cam_key]
+        for colour in list(history.keys()):
+            bbox, frames_left = history[colour]
+            if frames_left <= 1:
+                del history[colour]
+            else:
+                history[colour] = (bbox, frames_left - 1)
+
+        # Update history with current frame's detections
         for cand in candidates:
-            x, y, w_, h_ = cand['bbox']
-            r, g, b = COLOUR_RGB.get(cand['colour'], (0.8, 0.8, 0.8))
+            history[cand['colour']] = (cand['bbox'], 8)  # persist for 8 frames
+
+        # Draw all active visual detections in history
+        vis = rgb.copy()
+        for colour, (bbox, _) in history.items():
+            x, y, w_, h_ = bbox
+            r, g, b = COLOUR_RGB.get(colour, (0.8, 0.8, 0.8))
             colour_bgr = (int(b * 255), int(g * 255), int(r * 255))
             cv2.rectangle(vis, (x, y), (x + w_, y + h_), colour_bgr, 2)
-            cv2.putText(vis, cand['colour'], (x, max(15, y - 5)),
+            cv2.putText(vis, colour, (x, max(15, y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour_bgr, 1)
+
         wname = 'barrels_oakd' if cam_key == 'oakd' else 'barrels_top'
         cv2.imshow(wname, vis)
 

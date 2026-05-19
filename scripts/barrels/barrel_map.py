@@ -15,7 +15,7 @@ import numpy as np
 
 
 # Constants used by the tracker. See plan for rationale.
-MERGE_DIST = 0.7      # m
+MERGE_DIST = 0.45     # m (prevent side-by-side barrels from merging)
 CONFIRM_OBS = 6
 CONFIRM_TRACE = 0.20
 
@@ -40,6 +40,7 @@ class BarrelLandmark:
     spill_position: Optional[np.ndarray] = None
     pending_spill_count: int = 0   # candidate observations from any camera
     confirmed_spill_cameras: set = field(default_factory=set)
+    confirmed_cameras: set = field(default_factory=set)
 
     # Bottom-of-barrel anchor (for spill search seed and RViz spill marker)
     ground_anchor: Optional[np.ndarray] = None
@@ -70,9 +71,12 @@ class BarrelMap:
         self.R = np.eye(3) * 0.3
         self.Q = np.eye(3) * 0.01
 
-    def _nearest(self, pos: np.ndarray) -> Optional[tuple[int, float]]:
+    def _nearest(self, pos: np.ndarray, colour: str) -> Optional[tuple[int, float]]:
         best_i, best_d = None, float('inf')
         for i, lm in enumerate(self.landmarks):
+            # Only match landmarks of the same color!
+            if lm.colour != colour:
+                continue
             d = float(np.linalg.norm(lm.position - pos))
             if d < best_d:
                 best_i, best_d = i, d
@@ -82,9 +86,10 @@ class BarrelMap:
                pos: np.ndarray,
                colour: str,
                orientation: str,
-               ground_anchor: Optional[np.ndarray] = None) -> Optional[BarrelLandmark]:
+               ground_anchor: Optional[np.ndarray] = None,
+               camera_id: str = 'unknown') -> Optional[BarrelLandmark]:
         """Insert or update a landmark; returns the affected landmark (or None if rejected)."""
-        nearest = self._nearest(pos)
+        nearest = self._nearest(pos, colour)
 
         if nearest is None or nearest[1] > MERGE_DIST:
             lm = BarrelLandmark(
@@ -96,11 +101,13 @@ class BarrelMap:
                 orientation_history=[orientation],
                 ground_anchor=None if ground_anchor is None else ground_anchor.copy(),
             )
+            lm.confirmed_cameras.add(camera_id)
             self.landmarks.append(lm)
             return lm
 
         i, _ = nearest
         lm = self.landmarks[i]
+        lm.confirmed_cameras.add(camera_id)
 
         # Mahalanobis outlier rejection (verbatim from ring_map.py).
         innovation = pos - lm.position
@@ -130,9 +137,9 @@ class BarrelMap:
                 lm.ground_anchor = 0.7 * lm.ground_anchor + 0.3 * ground_anchor
         return lm
 
-    def nearest_landmark(self, pos: np.ndarray,
+    def nearest_landmark(self, pos: np.ndarray, colour: str,
                          max_dist: float) -> Optional[BarrelLandmark]:
-        nearest = self._nearest(pos)
+        nearest = self._nearest(pos, colour)
         if nearest is None:
             return None
         i, d = nearest
@@ -177,9 +184,17 @@ class BarrelMap:
             landmark.leaking = True
 
     def confirmed_landmarks(self) -> List[BarrelLandmark]:
-        return [
-            lm for lm in self.landmarks
-            if lm.observations >= CONFIRM_OBS
-            and float(np.trace(lm.covariance)) < CONFIRM_TRACE
-            and lm.orientation != 'ambiguous'
-        ]
+        confirmed = []
+        for lm in self.landmarks:
+            if lm.orientation == 'ambiguous':
+                continue
+            
+            # Highly robust filter: if it was seen by OAK-D, it confirms in 6 frames.
+            # If it was only seen by the more jittery top camera, it requires 18 frames
+            # to prevent transient false detections (like the conveyor opening) from confirming.
+            has_oakd = 'oakd' in lm.confirmed_cameras
+            required_obs = CONFIRM_OBS if has_oakd else (CONFIRM_OBS * 3)
+
+            if lm.observations >= required_obs and float(np.trace(lm.covariance)) < CONFIRM_TRACE:
+                confirmed.append(lm)
+        return confirmed
