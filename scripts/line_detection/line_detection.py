@@ -53,6 +53,12 @@ class LineDetector(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.pc_pub = self.create_publisher(PointCloud2, '/line_detector/points', 10)
+        self.class_pubs = {
+            1: self.create_publisher(PointCloud2, '/line_detector/yellow', 10),
+            2: self.create_publisher(PointCloud2, '/line_detector/red',    10),
+            3: self.create_publisher(PointCloud2, '/line_detector/blue',   10),
+            4: self.create_publisher(PointCloud2, '/line_detector/green',  10),
+        }
 
         self.rgb_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/image_raw")
         self.depth_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/depth")
@@ -260,10 +266,18 @@ class LineDetector(Node):
             pts = np.stack([ros_x, ros_y, ros_z, np.ones_like(ros_x)], axis=1)  # (N,4)
             pts_world = (T @ pts.T).T  # (N,4)
 
-            all_xyz.append(pts_world[:, :3].astype(np.float32))
-
+            class_xyz = pts_world[:, :3].astype(np.float32)
             b, g, r = colors_bgr.get(class_id, (255, 255, 255))
-            all_rgb.append(np.tile([r, g, b], (len(pts_world), 1)).astype(np.uint8))
+            class_rgb = np.tile([r, g, b], (len(class_xyz), 1)).astype(np.uint8)
+
+            # Publish per-class topic
+            if class_id in self.class_pubs:
+                self.class_pubs[class_id].publish(
+                    self._make_pointcloud2(class_xyz, class_rgb, stamp)
+                )
+
+            all_xyz.append(class_xyz)
+            all_rgb.append(class_rgb)
 
         if not all_xyz:
             return
@@ -272,6 +286,8 @@ class LineDetector(Node):
         rgb = np.concatenate(all_rgb, axis=0)
         self.pc_pub.publish(self._make_pointcloud2(xyz, rgb, stamp))
 
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _transform_to_matrix(self, t, q):
         """Quaternion + translation → 4×4 homogeneous transform matrix."""
