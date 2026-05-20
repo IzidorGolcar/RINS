@@ -11,11 +11,16 @@ from geometry_msgs.msg import TwistStamped
 
 # ── Tuning parameters ────────────────────────────────────────────────────────
 
-LINEAR_SPEED       = 0.15   # m/s forward speed while following
+LINEAR_SPEED        = 0.15   # m/s forward speed while following
 ANGULAR_GAIN       = 1.2    # proportional gain for heading correction
 LOOKAHEAD_M        = 0.4    # how far ahead on the line to aim for (metres)
 SEARCH_SPEED       = 0.4    # rad/s rotation when searching
 LINE_TIMEOUT_S     = 1.0    # seconds without line before entering search mode
+
+# Intersection tuning parameters
+CHOSEN_ROUTE       = 'left' # Options: 'left' or 'right'
+INTERSECTION_THRESH = 0.25   # Width threshold (meters) of line points to flag intersection
+INTERSECTION_COOLDOWN = 3.0 # Seconds to wait before detecting another intersection
 
 
 class BlueLineFollower(Node):
@@ -36,6 +41,9 @@ class BlueLineFollower(Node):
         # Latest line points in map frame (N,3)
         self.line_pts = None
         self.last_line_time = None
+        
+        # Track last intersection time to prevent log spamming
+        self.last_intersection_time = None
 
         # Robot pose in map frame — we get this from odom via TF
         import tf2_ros
@@ -44,7 +52,7 @@ class BlueLineFollower(Node):
 
         # Control loop at 20 Hz
         self.create_timer(0.05, self.control_loop)
-        self.get_logger().info('Blue line follower started')
+        self.get_logger().info(f'Blue line follower started. Router configured to turn: {CHOSEN_ROUTE}')
 
 
     def pointcloud_callback(self, msg: PointCloud2):
@@ -103,48 +111,78 @@ class BlueLineFollower(Node):
 
         pts = self.line_pts  # (N,3) map frame
 
-        # ── Find nearest point on the line to the robot ──────────────────────
-        dists = np.sqrt((pts[:, 0] - rx)**2 + (pts[:, 1] - ry)**2)
-        nearest_idx = int(np.argmin(dists))
-        nearest_dist = dists[nearest_idx]
+        # ── Transform points to Robot Local Frame ───────────────────────────
+        # This makes intersection analysis significantly cleaner than managing it in map frame
+        cos_yaw = np.cos(ryaw)
+        sin_yaw = np.sin(ryaw)
+        
+        dx = pts[:, 0] - rx
+        dy = pts[:, 1] - ry
+        
+        # Local X is forward, Local Y is lateral left
+        local_x = dx * cos_yaw + dy * sin_yaw
+        local_y = -dx * sin_yaw + dy * cos_yaw
+
+        # ── Intersection Detection ───────────────────────────────────────────
+        # Look at line points in a window slightly ahead of the robot
+        look_zone_mask = (local_x > 0.1) & (local_x < 0.6)
+        
+        if look_zone_mask.any():
+            lateral_spread = np.max(local_y[look_zone_mask]) - np.min(local_y[look_zone_mask])
+            
+            if lateral_spread > INTERSECTION_THRESH:
+                # Check cooldown to avoid multi-triggering on the same intersection
+                time_since_last = (
+                    (now - self.last_intersection_time).nanoseconds / 1e9
+                    if self.last_intersection_time is not None else float('inf')
+                )
+                if time_since_last > INTERSECTION_COOLDOWN:
+                    self.get_logger().info(f'⚠️ INTERSECTION DETECTED! Choosing route: {CHOSEN_ROUTE.upper()}')
+                    self.last_intersection_time = now
+
+        # ── Filter points based on chosen route ─────────────────────────────
+        # If we are inside an active intersection area, prune points from the unselected side
+        # so pure pursuit targets our intended lane.
+        if self.last_intersection_time is not None and (now - self.last_intersection_time).nanoseconds / 1e9 < 1.5:
+            if CHOSEN_ROUTE == 'left':
+                route_mask = local_y >= -0.05  # Keep left points + small buffer
+            else:
+                route_mask = local_y <= 0.05   # Keep right points + small buffer
+                
+            # Apply filter
+            pts = pts[route_mask]
+            local_x = local_x[route_mask]
+            local_y = local_y[route_mask]
+
+        if len(pts) == 0:
+            self._publish_vel(0.0, SEARCH_SPEED)
+            return
 
         # ── End-of-line detection ────────────────────────────────────────────
-        # Sort all points by distance; if the nearest point is at the far end
-        # of the line (high index when sorted along path) we've reached the end.
-        # Simpler heuristic: if the robot has passed all line points (every
-        # point is behind the robot), stop.
-        # Project each point onto the robot's forward axis
-        forward = np.array([np.cos(ryaw), np.sin(ryaw)])
-        rel = pts[:, :2] - np.array([rx, ry])
-        projections = rel @ forward   # positive = ahead, negative = behind
-
-        ahead_mask = projections > 0.05
+        ahead_mask = local_x > 0.05
         if not ahead_mask.any():
-            # All line points are behind the robot — end of line
             self.get_logger().info('Reached end of line — stopping')
             self._publish_vel(0.0, 0.0)
             return
 
         # ── Pick lookahead point ─────────────────────────────────────────────
-        # Among points ahead of the robot, find the one closest to LOOKAHEAD_M
+        dists = np.sqrt(local_x**2 + local_y**2)
         ahead_indices = np.where(ahead_mask)[0]
         ahead_dists = dists[ahead_indices]
-        # target the point whose distance is closest to LOOKAHEAD_M
+        
         lookahead_idx = ahead_indices[int(np.argmin(np.abs(ahead_dists - LOOKAHEAD_M)))]
         target = pts[lookahead_idx, :2]   # (x, y) in map frame
 
         # ── Pure pursuit steering ────────────────────────────────────────────
-        # Angle from robot heading to target point
-        dx = target[0] - rx
-        dy = target[1] - ry
-        angle_to_target = np.arctan2(dy, dx)
+        tdx = target[0] - rx
+        tdy = target[1] - ry
+        angle_to_target = np.arctan2(tdy, tdx)
         heading_error = angle_to_target - ryaw
 
         # Wrap to [-pi, pi]
         heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
 
         angular = ANGULAR_GAIN * heading_error
-        # Slow down on sharp turns
         linear = LINEAR_SPEED * max(0.0, 1.0 - abs(heading_error) / np.pi)
 
         self._publish_vel(linear, angular)
