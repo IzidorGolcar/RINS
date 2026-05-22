@@ -1,0 +1,43 @@
+# RUN_TASK2.txt — ROS 2 Jazzy, factory-plant Task 2
+#
+# Open one terminal per block. Source the workspace in each first:
+#   source /opt/ros/jazzy/setup.bash
+#   source ~/ros2_ws/install/setup.bash
+#
+# Start order matters: sim+Nav2 first, then every detector, then dialogue,
+# then task2.py (the orchestrator). task2.py begins issuing prompts as
+# soon as it sees Nav2 + a few faces, so bring the others up before it.
+
+# === Terminal 1: simulation + Nav2 ===
+ros2 launch dis_tutorial3 sim_turtlebot_nav.launch.py \
+    world:=task2_yellow_demo \
+    map:=$(ros2 pkg prefix dis_tutorial3)/share/dis_tutorial3/maps/<map>.yaml
+
+# === Terminal 2: face detection (people + named identity + gender) ===
+ros2 run dis_tutorial3 detect_people.py
+
+# === Terminal 3: ring detection ===
+ros2 run dis_tutorial3 detect_rings.py
+
+# === Terminal 4: barrel detection (OAK-D + top_camera fusion) ===
+ros2 run dis_tutorial3 detect_barrels.py
+
+# === Terminal 5: line detection (friend's node — publishes /lines/*) ===
+ros2 run dis_tutorial3 line_detection.py
+
+# === Terminal 6: anomaly detection (red/green cell tiles) ===
+ros2 run dis_tutorial3 anomaly_detector.py
+
+# === Terminal 7: arm control (listens on /arm_command) ===
+ros2 run dis_tutorial3 arm_mover_actions.py
+
+# === Terminal 8: dialogue (Vosk STT + espeak-ng TTS + QR fallback) ===
+ros2 run dis_tutorial3 dialogue_node.py
+
+# === Terminal 9: orchestrator (start LAST) ===
+ros2 run dis_tutorial3 task2.py
+
+# --- Optional sanity-check topic echoes (any extra terminal) ---
+# ros2 topic echo /dialogue/intent
+# ros2 topic echo /barrel_inspections
+# ros2 topic echo /inspection/path

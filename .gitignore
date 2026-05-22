@@ -1,3 +1,9 @@
 .vscode/
 .DS_Store
 __pycache__/
+
+# Vosk speech model (download per-machine, see README)
+models/vosk-*
+
+# Local persistence written by detect_people / orchestrator
+~/.ros/known_*

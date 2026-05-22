@@ -6,6 +6,37 @@
 ![robots](figs/robots.png)
 *The Company of iRobot*
 
+## Task 2 dependencies (per-machine, ROS 2 Jazzy on Linux)
+
+Install once on each lab machine where Task 2 will run:
+
+```bash
+# System packages
+sudo apt update
+sudo apt install -y \
+    espeak-ng \
+    libzbar0 \
+    portaudio19-dev          # required by sounddevice for mic capture
+
+# Python packages (use the same Python ROS 2 Jazzy uses)
+pip install --user \
+    vosk \
+    sounddevice \
+    pyzbar \
+    reportlab
+
+# Vosk English model (small, ~50 MB) — kept out of git, downloaded per machine
+mkdir -p ~/ros2_ws/src/RINS/models
+cd ~/ros2_ws/src/RINS/models
+wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+unzip vosk-model-small-en-us-0.15.zip
+mv vosk-model-small-en-us-0.15 vosk-small-en
+```
+
+See `RUN_TASK2.txt` in the repo root for the per-terminal launch commands.
+
+
+
 ## TurtleBot4
 
 The TurtleBot4 platform consists of two main parts:

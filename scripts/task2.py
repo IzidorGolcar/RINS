@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """Task 2 (Industry 5.0) orchestrator.
 
-Builds on task1.py's pattern:
-  * RobotCommander subclass drives Nav2 via goToPose
-  * Detection nodes publish MarkerArray on /people_markers (and friends);
-    we subscribe and react.
-Adds:
-  * Yellow-line safety stop driven by /lines/yellow_alert.
-  * Worker recognition: only approach faces that have been recognised by
-    detect_people (i.e. carry a name+role label, not 'Face N').
-  * Blue-line following in the second room, driven by /lines/blue_target.
-  * Stub task dispatch / dialogue (real ASR + barrels + anomalies are
-    separate sub-tasks that get merged later).
+RobotCommander subclass that:
+  * Boustrophedon-explores the first room (coverage path generated
+    from /map) until every named worker has been greeted.
+  * On finding a worker, approaches them, spins to face them, then
+    runs a dialogue exchange via the dialogue_node (Vosk STT + TTS +
+    QR fallback). The dialogue node publishes /dialogue/intent which
+    we wait for.
+  * Dispatches the chosen task: barrels (visit each horizontal barrel
+    for spill confirmation), rings (count + colour-classify from
+    /ring_markers), or anomaly_red/_green (drive to the cell pose,
+    sweep belt with arm wrist camera).
+  * Aggregates results into an InspectionReport that is written as
+    PDF (reportlab) or Markdown after meeting the CTO.
 
-Out of scope here: ASR/dialogue, barrel inspection, anomaly model, PDF
-report generation, new SLAM map.
+Topic contract:
+  Sub  /map, /people_markers, /recognized_people,
+       /barrel_markers, /barrel_inspections, /ring_markers,
+       /tile_markers, /dialogue/intent,
+       /lines/{yellow_alert,blue_target,cell_detected,
+              red_cell_pose,green_cell_pose}
+  Pub  /cmd_vel_nav, /arm_command,
+       /dialogue/{prompt,say}, /inspection/path
 """
 
 import json
 import math
 import os
 import re
-import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from enum import Enum, auto
@@ -37,20 +45,27 @@ from std_msgs.msg import Bool, String
 from visualization_msgs.msg import MarkerArray
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'report'))
 from robot_commander import RobotCommander  # noqa: E402
 from task1 import COVERAGE_SPACING, ROBOT_CLEARANCE, SWEEP_AXIS  # noqa: E402
+from inspection_report import (  # noqa: E402
+    BarrelEntry, InspectionReport, RingsSummary, TileEntry,
+)
 
 
 # ---- Tunables -------------------------------------------------------------
 
 APPROACH_DIST = 0.7         # m — stand-off when greeting a worker
-ESPEAK_SPEED  = 140         # words per minute
 SAFETY_BACKUP_DIST = 0.15   # m — reverse this far when /yellow_alert fires
 SAFETY_BACKUP_VEL  = -0.10  # m/s
 BLUE_FOLLOW_TIMEOUT = 2.0   # s — stop following if line vanishes for longer
 BLUE_GOAL_REPLAN_PERIOD = 0.5  # s — how often we re-publish a blue follow goal
 EXIT_FIRST_ROOM_GOAL = (4.5, 0.0, 0.0)   # (x, y, yaw_deg) — placeholder; tune
 CTO_NAME = 'jeff'  # see personnel/jeff_he_him_cto.png
+
+DIALOGUE_TIMEOUT_S = 30.0   # how long to wait for /dialogue/intent
+BELT_SWEEP_DIST = 1.8       # m — distance to drive along the conveyor belt
+BELT_SWEEP_VEL  = 0.08      # m/s — slow so anomaly_detector has frames to lock
 
 
 _MAP_QOS = QoSProfile(
@@ -89,9 +104,12 @@ class Task2Node(RobotCommander):
         # Faces (named only)
         self.known_faces: dict[int, dict] = {}     # id -> {pos, name, role, gender}
         self.greeted_ids: set[int]   = set()
+        self.greeted_names: set[str] = set()       # dedup across face-id flicker
         self.to_greet: deque[int] = deque()
         self._current_face_id: int | None = None
         self._cto_face_id: int | None = None
+        self._chosen_task: str | None = None
+        self._chosen_task_requestor: str | None = None
 
         # Line state
         self._yellow_alert = False
@@ -99,27 +117,54 @@ class Task2Node(RobotCommander):
         self._blue_target: PoseStamped | None = None
         self._last_blue_target_at = 0.0
         self._cell_seen: str | None = None
+        self._red_cell_pose: PoseStamped | None = None
+        self._green_cell_pose: PoseStamped | None = None
 
-        # Dialogue stub: parameter the user (or another node) can set with the
-        # task name to perform when in DIALOGUE state.
+        # Detector beliefs (populated from marker topics).
+        self.barrels: dict[int, dict] = {}     # barrel id -> dict from /barrel_inspections
+        self.rings:   dict[int, dict] = {}     # ring id   -> {position, color_rgb}
+        self.tiles:   dict[int, dict] = {}     # tile id   -> {position, anomalous}
+
+        # Dialogue exchange state.
+        self._latest_intent: dict | None = None
+        self._intent_event = threading.Event()
+
+        # Inspection report aggregator.
+        self.report = InspectionReport(robot_name='R2D2')
+
         self.declare_parameters('', [
-            ('dialogue_response', ''),  # 'barrels' | 'rings' | 'anomaly_red' | 'anomaly_green' | ''
             ('declare_first_room_only', True),
             ('exit_x', EXIT_FIRST_ROOM_GOAL[0]),
             ('exit_y', EXIT_FIRST_ROOM_GOAL[1]),
             ('exit_yaw_deg', EXIT_FIRST_ROOM_GOAL[2]),
+            ('cell_red_xy', ''),
+            ('cell_green_xy', ''),
         ])
 
         # Subscriptions
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, _MAP_QOS)
         self.create_subscription(MarkerArray,   '/people_markers', self._people_marker_cb, 10)
+        self.create_subscription(MarkerArray,   '/barrel_markers', self._barrel_marker_cb, 10)
+        self.create_subscription(String,        '/barrel_inspections', self._barrel_json_cb, 10)
+        self.create_subscription(MarkerArray,   '/ring_markers',  self._ring_marker_cb, 10)
+        self.create_subscription(MarkerArray,   '/tile_markers',  self._tile_marker_cb, 10)
         self.create_subscription(Bool,          '/lines/yellow_alert', self._yellow_cb, 10)
         self.create_subscription(PoseStamped,   '/lines/blue_target',  self._blue_cb,   10)
         self.create_subscription(String,        '/lines/cell_detected', self._cell_cb,  10)
+        self.create_subscription(PoseStamped,   '/lines/red_cell_pose',
+                                 self._red_cell_pose_cb, 10)
+        self.create_subscription(PoseStamped,   '/lines/green_cell_pose',
+                                 self._green_cell_pose_cb, 10)
         self.create_subscription(String,        '/recognized_people',  self._known_people_cb, 10)
+        self.create_subscription(String,        '/dialogue/intent',    self._dialogue_intent_cb, 10)
 
-        # Direct cmd_vel for the safety backup (Nav2 owns /cmd_vel_nav).
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel_nav', 10)
+        # Publishers
+        # Direct cmd_vel for the safety backup + belt sweep (Nav2 owns /cmd_vel_nav).
+        self.cmd_vel_pub     = self.create_publisher(TwistStamped, '/cmd_vel_nav',     10)
+        self.arm_cmd_pub     = self.create_publisher(String,       '/arm_command',     10)
+        self.dlg_prompt_pub  = self.create_publisher(String,       '/dialogue/prompt', 10)
+        self.dlg_say_pub     = self.create_publisher(String,       '/dialogue/say',    10)
+        self.report_path_pub = self.create_publisher(String,       '/inspection/path', _MAP_QOS)
 
         self.state = State.EXPLORE_FIRST_ROOM
 
@@ -180,9 +225,10 @@ class Task2Node(RobotCommander):
             if name == CTO_NAME:
                 self._cto_face_id = fid
                 self.info(f'CTO ({name}) registered as face #{fid}.')
-            if fid not in self.greeted_ids:
-                self.to_greet.append(fid)
-                self.info(f'New worker {name} ({role}) queued at face #{fid}.')
+            if fid in self.greeted_ids or name in self.greeted_names:
+                continue
+            self.to_greet.append(fid)
+            self.info(f'New worker {name} ({role}) queued at face #{fid}.')
 
     def _yellow_cb(self, msg: Bool) -> None:
         self._yellow_alert = bool(msg.data)
@@ -195,6 +241,60 @@ class Task2Node(RobotCommander):
 
     def _cell_cb(self, msg: String) -> None:
         self._cell_seen = msg.data
+
+    def _red_cell_pose_cb(self, msg: PoseStamped) -> None:
+        self._red_cell_pose = msg
+
+    def _green_cell_pose_cb(self, msg: PoseStamped) -> None:
+        self._green_cell_pose = msg
+
+    def _barrel_marker_cb(self, msg: MarkerArray) -> None:
+        for m in msg.markers:
+            if m.ns != 'confirmed_barrels':
+                continue
+            entry = self.barrels.setdefault(m.id, {})
+            entry['position'] = (m.pose.position.x, m.pose.position.y, m.pose.position.z)
+
+    def _barrel_json_cb(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(payload, list):
+            return
+        for entry in payload:
+            bid = int(entry.get('id', -1))
+            if bid < 0:
+                continue
+            self.barrels[bid] = entry  # full JSON snapshot replaces local store
+
+    def _ring_marker_cb(self, msg: MarkerArray) -> None:
+        for m in msg.markers:
+            if m.ns != 'confirmed_rings':
+                continue
+            self.rings[m.id] = {
+                'position': (m.pose.position.x, m.pose.position.y, m.pose.position.z),
+                'color_rgb': (m.color.r, m.color.g, m.color.b),
+            }
+
+    def _tile_marker_cb(self, msg: MarkerArray) -> None:
+        for m in msg.markers:
+            if m.ns != 'tiles':
+                continue
+            # anomaly_detector encodes status via marker colour (red == anomalous).
+            anomalous = m.color.r > 0.5 and m.color.g < 0.5
+            self.tiles[m.id] = {
+                'position': (m.pose.position.x, m.pose.position.y, m.pose.position.z),
+                'anomalous': bool(anomalous),
+            }
+
+    def _dialogue_intent_cb(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        self._latest_intent = payload
+        self._intent_event.set()
 
     def _known_people_cb(self, msg: String) -> None:
         # Re-hydrate from detect_people's persistence so we recover after restarts.
@@ -339,17 +439,48 @@ class Task2Node(RobotCommander):
         return goal
 
     def _say(self, text: str) -> None:
-        self.info(f'Speaking: "{text}"')
-        try:
-            proc = subprocess.Popen(
-                ['espeak-ng', '-s', str(ESPEAK_SPEED), text],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            self.warn('espeak-ng not installed; skipping speech.')
+        """Speak via the dialogue node (fire-and-forget; node serialises TTS)."""
+        if not text:
             return
-        while proc.poll() is None:
-            self._spin_ros(0.05)
+        self.info(f'Speaking: "{text}"')
+        self.dlg_say_pub.publish(String(data=text))
+
+    # ---- Dialogue exchange -------------------------------------------------
+
+    def _do_dialogue(self, face: dict, face_id: int | None) -> str | None:
+        """Run one prompt → /dialogue/intent round-trip. Returns the intent or None."""
+        gender_word = 'man' if face.get('gender') == 'male' else 'woman'
+        text = f'Hi {gender_word}, which task should I perform?'
+        payload = {
+            'text': text,
+            'gender': face.get('gender'),
+            'face_id': face_id,
+            'expects_intent': True,
+        }
+        self._latest_intent = None
+        self._intent_event.clear()
+        self.dlg_prompt_pub.publish(String(data=json.dumps(payload)))
+        if not self._wait_for_intent(timeout=DIALOGUE_TIMEOUT_S):
+            self.warn('Dialogue timed out with no intent.')
+            return None
+        return (self._latest_intent or {}).get('intent')
+
+    def _wait_for_intent(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and rclpy.ok():
+            self._spin_ros(0.1)
+            if self._intent_event.is_set():
+                return True
+        return False
+
+    @staticmethod
+    def _intent_to_words(intent: str) -> str:
+        return {
+            'barrels':       'inspect the barrels',
+            'rings':         'count the rings',
+            'anomaly_red':   'inspect anomalies in the red cell',
+            'anomaly_green': 'inspect anomalies in the green cell',
+        }.get(intent, intent.replace('_', ' '))
 
     # ---- Safety stop -------------------------------------------------------
 
@@ -450,6 +581,7 @@ class Task2Node(RobotCommander):
                 self.info(f'Approaching {face["name"]} ({face["role"]}) at ({fx:.2f}, {fy:.2f})')
                 self.goToPose(self._approach_pose(fx, fy))
                 if self._wait_nav_with_safety():
+                    self._face_person(fx, fy)
                     self.state = State.DIALOGUE
                 else:
                     # Re-queue and try again later.
@@ -460,23 +592,38 @@ class Task2Node(RobotCommander):
                 fid = self._current_face_id
                 face = self.known_faces.get(fid, {}) if fid is not None else {}
                 name = face.get('name', 'there')
-                gender_word = 'man' if face.get('gender') == 'male' else 'woman'
-                self._say(f'Hi {gender_word}, which task should I perform?')
 
-                # Stub: read the task from the dialogue_response parameter.
-                response = self.get_parameter('dialogue_response').get_parameter_value().string_value
-                if response:
-                    self._say(f'OK {name}, I will {response.replace("_", " ")}.')
+                intent = self._do_dialogue(face, fid)
+                self._chosen_task = intent
+                self._chosen_task_requestor = name.capitalize() if name and name != 'there' else 'unknown'
+                if intent and intent != 'nothing':
+                    self._say(f'OK {name}, I will {self._intent_to_words(intent)}.')
                     self.state = State.EXECUTE_TASK
                 else:
-                    self.info(f'No dialogue response set for {name}; marking greeted.')
+                    self._say('OK, never mind then.')
                     self.state = State.EXPLORE_FIRST_ROOM
+
                 if fid is not None:
                     self.greeted_ids.add(fid)
+                if name and name != 'there':
+                    self.greeted_names.add(name)
                 self._current_face_id = None
 
             elif self.state == State.EXECUTE_TASK:
-                self.info('EXECUTE_TASK is a stub — handed off to a separate sub-task.')
+                intent = self._chosen_task
+                requestor = self._chosen_task_requestor or 'unknown'
+                if intent == 'barrels':
+                    self._run_barrel_inspection(requestor)
+                elif intent == 'rings':
+                    self._run_ring_counting(requestor)
+                elif intent == 'anomaly_red':
+                    self._run_anomaly_inspection('red', requestor)
+                elif intent == 'anomaly_green':
+                    self._run_anomaly_inspection('green', requestor)
+                else:
+                    self.info(f'EXECUTE_TASK: unrecognised intent {intent!r}; skipping.')
+                self._chosen_task = None
+                self._chosen_task_requestor = None
                 self.state = State.EXPLORE_FIRST_ROOM
 
             elif self.state == State.EXIT_FIRST_ROOM:
@@ -532,6 +679,8 @@ class Task2Node(RobotCommander):
                 fx, fy, _ = self.known_faces[fid]['pos']
                 self.goToPose(self._approach_pose(fx, fy))
                 self._wait_nav_with_safety()
+                self._face_person(fx, fy)
+                self._finalize_report()
                 self._say('Inspection report ready, sir.')
                 self.state = State.DONE
 
@@ -568,6 +717,212 @@ class Task2Node(RobotCommander):
         # Face the goal direction.
         target.pose.orientation = self.YawToQuaternion(math.atan2(gy - ry, gx - rx))
         return target
+
+    # ---- Sub-task execution (called from EXECUTE_TASK) ---------------------
+
+    def _current_yaw(self) -> float | None:
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            return None
+        q = self.current_pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def _face_person(self, fx: float, fy: float) -> None:
+        """Final small spin so the front camera + mic point at the person."""
+        if not (hasattr(self, 'current_pose') and self.current_pose is not None):
+            return
+        rx = self.current_pose.pose.position.x
+        ry = self.current_pose.pose.position.y
+        target_yaw = math.atan2(fy - ry, fx - rx)
+        cur_yaw = self._current_yaw()
+        if cur_yaw is None:
+            return
+        delta = math.atan2(math.sin(target_yaw - cur_yaw),
+                           math.cos(target_yaw - cur_yaw))
+        if abs(delta) < math.radians(5):
+            return
+        self.spin(spin_dist=float(delta), time_allowance=5)
+        # Wait for spin to finish (or yellow safety to fire).
+        while not self.isTaskComplete():
+            self._spin_ros()
+            if self._check_yellow_safety():
+                return
+
+    def _arm(self, pose: str) -> None:
+        self.arm_cmd_pub.publish(String(data=pose))
+
+    def _run_barrel_inspection(self, requestor: str) -> None:
+        if not self.barrels:
+            self._say('I have not detected any barrels.')
+            self.report.add_execution(requestor, 'barrels', [])
+            return
+
+        # Park the arm down so detect_barrels.py's top_camera pipeline can
+        # confirm spills under horizontal barrels.
+        self._arm('look_for_qr')
+
+        # Iterate barrels in id order for deterministic reporting.
+        for bid in sorted(self.barrels.keys()):
+            entry = self.barrels[bid]
+            pos = entry.get('position')
+            orientation = entry.get('orientation', 'ambiguous')
+            if not pos or orientation == 'vertical':
+                # Vertical barrels can't leak; no need to approach.
+                continue
+            bx, by, _ = pos
+            self.info(f'Approaching barrel #{bid} at ({bx:.2f}, {by:.2f}) for spill check.')
+            self.goToPose(self._approach_pose(bx, by))
+            if not self._wait_nav_with_safety():
+                continue
+            # Linger so detect_barrels accumulates confirmation frames.
+            t_end = time.monotonic() + 2.0
+            while time.monotonic() < t_end and rclpy.ok():
+                self._spin_ros(0.1)
+            updated = self.barrels.get(bid, entry)
+            if updated.get('leaking'):
+                self._say('Alert! Alert! This barrel is leaking!')
+
+        # Park the arm back up so it doesn't drag.
+        self._arm('garage')
+
+        # Snapshot the final state into the report.
+        results = []
+        for bid in sorted(self.barrels.keys()):
+            e = self.barrels[bid]
+            results.append(BarrelEntry(
+                id=bid,
+                colour=str(e.get('colour', 'unknown')),
+                orientation=str(e.get('orientation', 'unknown')),
+                leaking=bool(e.get('leaking', False)),
+            ))
+        self.report.add_execution(requestor, 'barrels', results)
+        self._say(f'I inspected {len(results)} barrels.')
+
+    def _run_ring_counting(self, requestor: str) -> None:
+        per_colour: dict[str, int] = {}
+        for r in self.rings.values():
+            cr, cg, cb = r.get('color_rgb', (0.5, 0.5, 0.5))
+            colour = self._classify_ring_colour(cr, cg, cb)
+            per_colour[colour] = per_colour.get(colour, 0) + 1
+        total = sum(per_colour.values())
+        summary = RingsSummary(total=total, per_colour=per_colour)
+        self.report.add_execution(requestor, 'rings', summary)
+
+        if total == 0:
+            self._say('I have not seen any rings.')
+            return
+        parts = ', '.join(f'{n} {c}' for c, n in sorted(per_colour.items()))
+        self._say(f'I counted {total} rings: {parts}.')
+
+    @staticmethod
+    def _classify_ring_colour(r: float, g: float, b: float) -> str:
+        # Compact discriminator over the spec palette.
+        if max(r, g, b) < 0.25:
+            return 'black'
+        if r > 0.6 and g < 0.4 and b < 0.4:
+            return 'red'
+        if g > 0.5 and r < 0.5 and b < 0.5:
+            return 'green'
+        if b > 0.5 and r < 0.5 and g < 0.7:
+            return 'blue'
+        if r > 0.7 and g > 0.6 and b < 0.4:
+            return 'yellow'
+        if r > 0.7 and g > 0.3 and g < 0.6 and b < 0.3:
+            return 'orange'
+        if r > 0.4 and b > 0.4 and g < 0.4:
+            return 'purple'
+        if r > 0.3 and g > 0.2 and b < 0.2:
+            return 'brown'
+        return 'unknown'
+
+    def _resolve_cell_pose(self, colour: str) -> PoseStamped | None:
+        # 1. Live topic from line_detection (friend's work).
+        topic_pose = self._red_cell_pose if colour == 'red' else self._green_cell_pose
+        if topic_pose is not None:
+            return topic_pose
+        # 2. Handcoded parameter fallback (spec p.15 permits this).
+        param = self.get_parameter(f'cell_{colour}_xy').get_parameter_value().string_value
+        if param.strip():
+            try:
+                parts = [float(x) for x in param.split(',')]
+                if len(parts) >= 2:
+                    yaw_deg = parts[2] if len(parts) > 2 else 0.0
+                    ps = PoseStamped()
+                    ps.header.frame_id = 'map'
+                    ps.header.stamp = self.get_clock().now().to_msg()
+                    ps.pose.position.x = parts[0]
+                    ps.pose.position.y = parts[1]
+                    ps.pose.orientation = self.YawToQuaternion(math.radians(yaw_deg))
+                    return ps
+            except ValueError:
+                self.warn(f'Bad cell_{colour}_xy parameter: {param!r}')
+        return None
+
+    def _run_anomaly_inspection(self, cell_colour: str, requestor: str) -> None:
+        pose = self._resolve_cell_pose(cell_colour)
+        if pose is None:
+            self._say(f'I do not know where the {cell_colour} cell is.')
+            self.report.add_execution(requestor, f'anomaly_{cell_colour}', [])
+            return
+
+        self.info(f'Driving to {cell_colour} cell.')
+        self.goToPose(pose)
+        if not self._wait_nav_with_safety():
+            self.report.add_execution(requestor, f'anomaly_{cell_colour}', [])
+            return
+
+        # Clear out tiles from any previous run so we report only this cell.
+        self.tiles.clear()
+
+        # Sweep the conveyor belt with the wrist camera.
+        self._arm('up')
+        time.sleep(0.5)
+        self._arm('look_at_belt_left')
+        self._belt_sweep(distance=BELT_SWEEP_DIST, velocity=BELT_SWEEP_VEL)
+        self._arm('look_at_belt_right')
+        self._belt_sweep(distance=BELT_SWEEP_DIST, velocity=-BELT_SWEEP_VEL)
+        self._arm('garage')
+
+        # Snapshot into the report.
+        results = [
+            TileEntry(id=tid, anomalous=bool(t.get('anomalous', False)))
+            for tid, t in sorted(self.tiles.items())
+        ]
+        self.report.add_execution(requestor, f'anomaly_{cell_colour}', results)
+        anomalous = sum(1 for t in results if t.anomalous)
+        self._say(f'Inspected {len(results)} tiles in the {cell_colour} cell. '
+                  f'{anomalous} appear damaged.')
+
+    def _belt_sweep(self, distance: float, velocity: float) -> None:
+        if velocity == 0:
+            return
+        duration = abs(distance / velocity)
+        deadline = time.monotonic() + duration
+        twist = TwistStamped()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = velocity
+        while time.monotonic() < deadline and rclpy.ok():
+            twist.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_vel_pub.publish(twist)
+            self._spin_ros(0.05)
+            if self._check_yellow_safety():
+                break
+        twist.twist.linear.x = 0.0
+        twist.header.stamp = self.get_clock().now().to_msg()
+        self.cmd_vel_pub.publish(twist)
+
+    # ---- Final report -----------------------------------------------------
+
+    def _finalize_report(self) -> None:
+        out_dir = os.path.expanduser('~/.ros')
+        try:
+            path = self.report.finalize(out_dir=out_dir)
+        except Exception as e:
+            self.error(f'Failed to write inspection report: {e}')
+            return
+        self.info(f'Inspection report saved to {path}')
+        self.report_path_pub.publish(String(data=str(path)))
 
 
 def main():
