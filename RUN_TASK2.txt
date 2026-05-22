@@ -22,7 +22,7 @@ ros2 run dis_tutorial3 detect_rings.py
 # === Terminal 4: barrel detection (OAK-D + top_camera fusion) ===
 ros2 run dis_tutorial3 detect_barrels.py
 
-# === Terminal 5: line detection (friend's node — publishes /lines/*) ===
+# === Terminal 5: line detection (publishes /lines/*) ===
 ros2 run dis_tutorial3 line_detection.py
 
 # === Terminal 6: anomaly detection (red/green cell tiles) ===
