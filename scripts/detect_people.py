@@ -61,11 +61,11 @@ class FaceDetector(Node):
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Haar cascades – secondary filter
+        cascade_dir = cv2.data.haarcascades if hasattr(cv2, 'data') else '/usr/share/opencv4/haarcascades/'
         self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            os.path.join(cascade_dir, 'haarcascade_frontalface_default.xml'))
         self.face_cascade_alt2 = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+            os.path.join(cascade_dir, 'haarcascade_frontalface_alt2.xml'))
 
         self.recognizer = self._build_recognizer()
 
@@ -169,11 +169,12 @@ class FaceDetector(Node):
                 cy = (y1 + y2) // 2
 
                 gray_roi = gray[y1:y2, x1:x2]
+                color_roi = cv_image[y1:y2, x1:x2]
                 if not self._haar_has_face(gray_roi):
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 180), 1)
                     continue
 
-                identity = self.recognizer.recognize(gray_roi) if self.recognizer else None
+                identity = self.recognizer.recognize(color_roi) if self.recognizer else None
                 label_text = (
                     f'{identity.name} ({identity.role})' if identity is not None
                     else f'{conf:.2f}'
@@ -259,10 +260,12 @@ class FaceDetector(Node):
             if np.linalg.norm(pos[:2] - face['pos'][:2]) < self.FACE_MIN_SEPARATION:
                 # Smooth position with a low-weight running update.
                 face['pos'] = 0.85 * face['pos'] + 0.15 * pos
+                votes = face.setdefault('votes', {})
                 if identity is not None:
-                    votes = face.setdefault('votes', {})
                     votes[identity.label_id] = votes.get(identity.label_id, 0.0) + identity.score
-                    self._refresh_identity(face)
+                else:
+                    votes[-1] = votes.get(-1, 0.0) + 0.45
+                self._refresh_identity(face)
                 return True
         return False
 
@@ -283,6 +286,8 @@ class FaceDetector(Node):
             if identity is not None:
                 cand['votes'][identity.label_id] = (
                     cand['votes'].get(identity.label_id, 0.0) + identity.score)
+            else:
+                cand['votes'][-1] = cand['votes'].get(-1, 0.0) + 0.45
 
             if cand['count'] >= self.CONFIRM_HITS:
                 face_id = self._next_face_id
@@ -309,6 +314,8 @@ class FaceDetector(Node):
             cand = {'pos': pos.copy(), 'count': 1, 'votes': {}}
             if identity is not None:
                 cand['votes'][identity.label_id] = identity.score
+            else:
+                cand['votes'][-1] = 0.45
             self.candidates.append(cand)
 
     def _refresh_identity(self, face: dict) -> None:
@@ -317,10 +324,18 @@ class FaceDetector(Node):
         if not votes or self.recognizer is None:
             return
         best_label = max(votes, key=lambda k: votes[k])
+        
+        previous = face.get('identity')
+        if best_label == -1:
+            face['identity'] = None
+            if previous is not None:
+                self._persist_and_publish()
+            return
+
         meta = self.recognizer.people.get(best_label)
         if meta is None:
             return
-        previous = face.get('identity')
+
         face['identity'] = Identity(
             label_id=best_label,
             name=meta['name'],
