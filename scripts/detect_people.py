@@ -38,6 +38,8 @@ class FaceDetector(Node):
     CONFIRM_HITS        = 2     # detections needed before face is confirmed
     CANDIDATE_RADIUS    = 0.4   # metres – cluster radius for candidates
     DEPTH_SAMPLE_RADIUS = 4     # pixels – neighbourhood radius for depth
+    YOLO_EVERY_N_FRAMES = 3     # run YOLO+FaceNet only this often
+    IDENTITY_LOCK_SCORE = 0.85  # stop re-running FaceNet above this confidence
 
     def __init__(self):
         super().__init__('face_detector')
@@ -57,6 +59,8 @@ class FaceDetector(Node):
         #                          'first_seen': iso8601 str}
         self.confirmed_faces: list[dict] = []
         self._next_face_id = 1
+        self._frame_count: int = 0
+        self._last_vis: np.ndarray | None = None
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -132,6 +136,16 @@ class FaceDetector(Node):
     # ----------------------------------------------------------- main callback
 
     def synced_callback(self, rgb_msg: Image, pc_msg: PointCloud2) -> None:
+        self._frame_count += 1
+
+        # Show the previous overlay on skipped frames so the window stays live
+        # without paying for YOLO + FaceNet inference.
+        if self._frame_count % self.YOLO_EVERY_N_FRAMES != 0:
+            if self._last_vis is not None:
+                cv2.imshow('Face Detection', self._last_vis)
+                cv2.waitKey(1)
+            return
+
         try:
             cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
         except CvBridgeError as e:
@@ -174,7 +188,23 @@ class FaceDetector(Node):
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 180), 1)
                     continue
 
-                identity = self.recognizer.recognize(color_roi) if self.recognizer else None
+                # Skip FaceNet when every confirmed face already has a
+                # high-confidence identity and there are no pending candidates
+                # — nothing new to classify.
+                all_locked = (
+                    bool(self.confirmed_faces)
+                    and not self.candidates
+                    and all(
+                        f.get('identity') is not None
+                        and f['identity'].score >= self.IDENTITY_LOCK_SCORE
+                        for f in self.confirmed_faces
+                    )
+                )
+                identity = (
+                    self.recognizer.recognize(color_roi)
+                    if self.recognizer and not all_locked
+                    else None
+                )
                 label_text = (
                     f'{identity.name} ({identity.role})' if identity is not None
                     else f'{conf:.2f}'
@@ -236,6 +266,7 @@ class FaceDetector(Node):
 
         cv2.putText(vis, f'Confirmed faces: {len(self.confirmed_faces)}',
                     (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        self._last_vis = vis
         cv2.imshow('Face Detection', vis)
         if cv2.waitKey(1) == 27:
             rclpy.shutdown()
