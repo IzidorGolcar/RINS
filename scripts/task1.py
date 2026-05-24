@@ -28,9 +28,9 @@ COVERAGE_SPACING = 0.9 # meters
 #   'y' – horizontal rows (robot sweeps left-right, rows advance up/down)
 #   'x' – vertical columns (robot sweeps up-down, columns advance left-right)
 # For tall arenas use 'x'; for wide arenas use 'y'.
-SWEEP_AXIS = 'x'
+SWEEP_AXIS = 'y'
 
-ROBOT_CLEARANCE  = 0.22   
+ROBOT_CLEARANCE  = 0.40   
 
 ARENA_X_MIN: float | None =  None
 ARENA_X_MAX: float | None =  None

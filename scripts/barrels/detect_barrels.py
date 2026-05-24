@@ -533,15 +533,17 @@ class BarrelDetector(Node):
         roi_rgb = rgb[y0:y1, x0:x1]
         roi_depth = depth[y0:y1, x0:x1]
         roi_hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_BGR2HSV)
-        
-        # Look ONLY for spills that match the barrel's colour to avoid mistaking floor lines
+
+        # Look ONLY for spills that match the barrel's colour to avoid
+        # mistaking floor lines for spills.
         sat_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
         for h_lo, s_lo, v_lo, h_hi, s_hi, v_hi in COLOUR_RANGES[barrel_colour]:
             if barrel_colour == 'black':
-                # Black spills are extremely dark patches on the floor
+                # Black spills are extremely dark patches on the floor.
                 sat_mask |= cv2.inRange(roi_hsv, np.array([0, 0, 0]), np.array([180, 255, 50]))
             else:
-                # For colored spills, we match the parent color but allow slightly lower saturation/value
+                # For coloured spills, match the parent colour but allow
+                # slightly lower saturation/value.
                 sat_mask |= cv2.inRange(roi_hsv, np.array([h_lo, 60, 40]), np.array([h_hi, 255, 255]))
 
         # Exclude depth pixels that are too far / NaN.

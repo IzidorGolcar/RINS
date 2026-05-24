@@ -16,7 +16,6 @@ bt_navigator:
     error_code_names:
       - compute_path_error_code
       - follow_path_error_code
-
 controller_server:
   ros__parameters:
     enable_stamped_cmd_vel: true
@@ -31,39 +30,45 @@ controller_server:
     use_realtime_priority: false
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.12
+      # Drop to 5 s so the BT recovery (clear costmap → backup → spin) fires
+      # quickly when the robot is wedged against an obstacle.
+      movement_time_allowance: 5.0
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.07
-      yaw_goal_tolerance: 0.05
+      # Tight tolerance is critical for the anomaly inspection: the
+      # robot must land EXACTLY on the stripe's start coordinate so the
+      # subsequent open-loop cmd_vel drive along the line doesn't sit
+      # offset toward the belt and clip it. (Was 0.22 / 3.14 — too
+      # loose: up to 22 cm of perpendicular offset and any yaw.)
+      xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.15
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.5
-      lookahead_dist: 0.6
-      min_lookahead_dist: 0.3
-      max_lookahead_dist: 0.9
+      desired_linear_vel: 0.975
+      lookahead_dist: 0.9
+      min_lookahead_dist: 0.55
+      max_lookahead_dist: 1.2
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 1.8
+      rotate_to_heading_angular_vel: 2.4
       transform_tolerance: 0.1
       use_velocity_scaled_lookahead_dist: false
-      min_approach_linear_velocity: 0.05
-      approach_velocity_scaling_dist: 0.6
-      use_collision_detection: true
-      max_allowed_time_to_collision_up_to_carrot: 1.0
+      min_approach_linear_velocity: 0.11
+      approach_velocity_scaling_dist: 0.25
+      use_collision_detection: false
+      max_allowed_time_to_collision_up_to_carrot: 0.3
       use_regulated_linear_velocity_scaling: true
       use_fixed_curvature_lookahead: false
       curvature_lookahead_dist: 0.25
       use_cost_regulated_linear_velocity_scaling: false
       regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.25
+      regulated_linear_scaling_min_speed: 0.10
       use_rotate_to_heading: true
       allow_reversing: false
-      rotate_to_heading_min_angle: 0.785
-      max_angular_accel: 3.2
+      rotate_to_heading_min_angle: 0.4
+      max_angular_accel: 3.6
       max_robot_pose_search_dist: 10.0
-
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -75,19 +80,12 @@ local_costmap:
       rolling_window: true
       width: 3
       height: 3
-      resolution: 0.06
-      footprint: "[[ 0.189,  0.000],
-                  [ 0.134, -0.134],
-                  [ 0.000, -0.189],
-                  [-0.134, -0.134],
-                  [-0.189,  0.000],
-                  [-0.134,  0.134],
-                  [ 0.000,  0.189],
-                  [ 0.134,  0.134]]"
+      resolution: 0.03
+      robot_radius: 0.16
       plugins: ["static_layer", "voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
+        cost_scaling_factor: 3.0
         inflation_radius: 0.45
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
@@ -98,9 +96,9 @@ local_costmap:
         z_voxels: 16
         max_obstacle_height: 2.0
         mark_threshold: 0
-        observation_sources: scan_filtered line_obstacles
-        scan:
-          topic: scan
+        observation_sources: scan_filtered
+        scan_filtered:
+          topic: scan_filtered
           max_obstacle_height: 2.0
           clearing: true
           marking: true
@@ -109,21 +107,10 @@ local_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
-        line_obstacles:
-          topic: /lines/yellow_obstacles
-          sensor_frame: base_link
-          max_obstacle_height: 0.2
-          min_obstacle_height: -0.05
-          clearing: false
-          marking: true
-          data_type: "PointCloud2"
-          obstacle_max_range: 1.5
-          obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
       always_send_full_costmap: true
-
 global_costmap:
   global_costmap:
     ros__parameters:
@@ -132,21 +119,14 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      footprint: "[[ 0.189,  0.000],
-                  [ 0.134, -0.134],
-                  [ 0.000, -0.189],
-                  [-0.134, -0.134],
-                  [-0.189,  0.000],
-                  [-0.134,  0.134],
-                  [ 0.000,  0.189],
-                  [ 0.134,  0.134]]"
-      resolution: 0.06
-      track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "yellow_line_layer", "inflation_layer"]
+      robot_radius: 0.16
+      resolution: 0.03
+      track_unknown_space: false
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan line_obstacles
+        observation_sources: scan
         scan:
           topic: scan
           max_obstacle_height: 2.0
@@ -157,54 +137,23 @@ global_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
-        line_obstacles:
-          topic: /lines/yellow_obstacles
-          sensor_frame: base_link
-          max_obstacle_height: 0.2
-          min_obstacle_height: -0.05
-          clearing: false
-          marking: true
-          data_type: "PointCloud2"
-          obstacle_max_range: 1.5
-          obstacle_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
+        cost_scaling_factor: 3.0
         inflation_radius: 0.45
-
-      yellow_line_layer:
-        plugin: "nav2_costmap_2d::ObstacleLayer"
-        enabled: true
-        observation_sources: yellow_line
-        yellow_line:
-          topic: /line_detector/yellow_obstacle
-          sensor_frame: map
-          data_type: PointCloud2
-          marking: true
-          clearing: true          # clears when line moves out of view
-          max_obstacle_height: 1.0
-          min_obstacle_height: -0.1
-          obstacle_max_range: 5.0
-          obstacle_min_range: 0.0
-          raytrace_max_range: 5.0
-          raytrace_min_range: 0.0
-
       always_send_full_costmap: true
-
 planner_server:
   ros__parameters:
     enable_stamped_cmd_vel: true
-    #expected_planner_frequency: 20.0
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner::NavfnPlanner"
       tolerance: 0.5
       use_astar: false
       allow_unknown: true
-
 smoother_server:
   ros__parameters:
     enable_stamped_cmd_vel: true
@@ -214,7 +163,6 @@ smoother_server:
       tolerance: 1.0e-10
       max_its: 1000
       do_refinement: true
-
 behavior_server:
   ros__parameters:
     enable_stamped_cmd_vel: true
@@ -226,6 +174,9 @@ behavior_server:
     behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
       plugin: "nav2_behaviors::Spin"
+      max_rotational_vel: 1.8
+      min_rotational_vel: 0.2
+      rotational_acc_lim: 2.0
     backup:
       plugin: "nav2_behaviors::BackUp"
     drive_on_heading:
@@ -237,12 +188,6 @@ behavior_server:
     global_frame: map
     local_frame: odom
     robot_base_frame: base_link
-    transform_tolerance: 0.1
-    simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
-
 waypoint_follower:
   ros__parameters:
     enable_stamped_cmd_vel: true
@@ -254,22 +199,22 @@ waypoint_follower:
       plugin: "nav2_waypoint_follower::WaitAtWaypoint"
       enabled: true
       waypoint_pause_duration: 200
-
 velocity_smoother:
   ros__parameters:
     enable_stamped_cmd_vel: true
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.26, 0.0, 1.0]
-    min_velocity: [-0.26, 0.0, -1.0]
-    max_accel: [2.5, 0.0, 3.2]
-    max_decel: [-2.5, 0.0, -3.2]
+    max_velocity: [0.75, 0.0, 4.05]
+    # min_velocity[0] must be negative for the Nav2 `backup` recovery
+    # behavior (and task2's yellow-line reverse) to actually move the wheels.
+    min_velocity: [-0.75, 0.0, -4.5]
+    max_accel: [2.4, 0.0, 3.6]
+    max_decel: [-2.4, 0.0, -3.6]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
-
 collision_monitor:
   ros__parameters:
     enable_stamped_cmd_vel: true
@@ -282,15 +227,13 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: True
     stop_pub_timeout: 2.0
-    # Polygons represent zone around the robot for "stop", "slowdown" and "limit" action types,
-    # and robot footprint for "approach" action type.
     polygons: ["FootprintApproach"]
     FootprintApproach:
       type: "polygon"
       action_type: "approach"
       footprint_topic: "local_costmap/published_footprint"
-      time_before_collision: 1.2
-      simulation_time_step: 0.1
+      time_before_collision: 0.30
+      simulation_time_step: 0.05
       min_points: 6
       visualize: False
       enabled: True
@@ -301,7 +244,6 @@ collision_monitor:
       min_height: 0.15
       max_height: 2.0
       enabled: True
-
 docking_server:
   ros__parameters:
     enable_stamped_cmd_vel: true
@@ -316,17 +258,14 @@ docking_server:
     fixed_frame: "odom"
     dock_backwards: false
     dock_prestaging_tolerance: 0.5
-
-    # Types of docks
     dock_plugins: ['simple_charging_dock']
     simple_charging_dock:
       plugin: 'opennav_docking::SimpleChargingDock'
       docking_threshold: 0.05
       staging_x_offset: -0.7
       use_external_detection_pose: true
-      use_battery_status: false # true
-      use_stall_detection: false # true
-
+      use_battery_status: false
+      use_stall_detection: false
       external_detection_timeout: 1.0
       external_detection_translation_x: -0.18
       external_detection_translation_y: 0.0
@@ -334,17 +273,8 @@ docking_server:
       external_detection_rotation_pitch: -1.57
       external_detection_rotation_yaw: 0.0
       filter_coef: 0.1
-
-    # Dock instances
-    # The following example illustrates configuring dock instances.
-    # docks: ['home_dock']  # Input your docks here
-    # home_dock:
-    #   type: 'simple_charging_dock'
-    #   frame: map
-    #   pose: [0.0, 0.0, 0.0]
-
     controller:
       k_phi: 3.0
       k_delta: 2.0
-      v_linear_min: 0.15
-      v_linear_max: 0.15
+      v_linear_min: 0.10
+      v_linear_max: 0.10

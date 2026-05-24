@@ -1,15 +1,15 @@
 <?xml version="1.0" ?>
 <robot name="turtlebot4" xmlns:xacro="http://ros.org/wiki/xacro">
   <!-- Base create3 model -->
-  <xacro:include filename="$(find dis_tutorial7)/urdf/create/create3.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/rplidar.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/oakd.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/top_camera.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/sensors/camera_bracket.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/standard/tower_standoff.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/standard/tower_sensor_plate.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/standard/weight_block.urdf.xacro" />
-  <xacro:include filename="$(find dis_tutorial7)/urdf/arm/arm.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/create/create3.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/rplidar.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/oakd.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/top_camera.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/sensors/camera_bracket.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/standard/tower_standoff.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/standard/tower_sensor_plate.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/standard/weight_block.urdf.xacro" />
+  <xacro:include filename="$(find dis_tutorial3)/urdf/arm/arm.urdf.xacro" />
 
 
   <!-- Mechanical properties -->
@@ -138,7 +138,7 @@
 
     <gazebo>
       <plugin filename="libgz_ros2_control-system.so" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
-        <parameters>$(find dis_tutorial7)/config/all_controls_jtc.yaml</parameters>
+        <parameters>$(find dis_tutorial3)/config/all_controls_jtc.yaml</parameters>
         <ros>
           <remapping>~/odom:=odom</remapping>
           <remapping>/tf:=tf</remapping>

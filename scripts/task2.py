@@ -40,7 +40,9 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
-                        QoSProfile, QoSReliabilityPolicy)
+                        QoSProfile, QoSReliabilityPolicy,
+                        qos_profile_sensor_data)
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import MarkerArray
 
@@ -55,13 +57,20 @@ from inspection_report import (  # noqa: E402
 
 # ---- Tunables -------------------------------------------------------------
 
-APPROACH_DIST = 0.7         # m — stand-off when greeting a worker
-SAFETY_BACKUP_DIST = 0.15   # m — reverse this far when /yellow_alert fires
+APPROACH_DIST = 0.30        # m — stand-off when greeting a worker. Must be < (face MIN_DIST=0.5 - nav2 xy_goal_tolerance=0.22) so even a face confirmed at min range forces a visible move.
+# Positive = counter-clockwise (look further left). The QR card sits to the
+# left of the face from the viewer's POV, so aiming a bit left of the face
+# brings the QR into the OAK-D's FoV for both dialogue + standalone QR scan.
+FACE_YAW_BIAS_DEG = 30.0
+SAFETY_BACKUP_DIST = 0.08   # m — reverse this far when /yellow_alert fires
 SAFETY_BACKUP_VEL  = -0.10  # m/s
 BLUE_FOLLOW_TIMEOUT = 2.0   # s — stop following if line vanishes for longer
 BLUE_GOAL_REPLAN_PERIOD = 0.5  # s — how often we re-publish a blue follow goal
-EXIT_FIRST_ROOM_GOAL = (4.5, 0.0, 0.0)   # (x, y, yaw_deg) — placeholder; tune
+EXIT_FIRST_ROOM_GOAL = (3.0, -0.5, -90.0)   # (x, y, yaw_deg) — blue-line entrance
 CTO_NAME = 'jeff'  # see personnel/jeff_he_him_cto.png
+FACES_TO_VISIT = 3          # hardcoded count of workers in the first room
+                            # (we leave once all are greeted; some may
+                            # decline a task and that's fine)
 
 DIALOGUE_TIMEOUT_S = 30.0   # how long to wait for /dialogue/intent
 BELT_SWEEP_DIST = 1.8       # m — distance to drive along the conveyor belt
@@ -106,10 +115,12 @@ class Task2Node(RobotCommander):
         self.greeted_ids: set[int]   = set()
         self.greeted_names: set[str] = set()       # dedup across face-id flicker
         self.to_greet: deque[int] = deque()
+        self._approach_retries: dict[int, int] = {}   # fid -> failed-nav count (for logging)
         self._current_face_id: int | None = None
         self._cto_face_id: int | None = None
         self._chosen_task: str | None = None
         self._chosen_task_requestor: str | None = None
+        self._tasks_executed: int = 0  # counts real task runs (not 'nothing')
 
         # Line state
         self._yellow_alert = False
@@ -119,6 +130,19 @@ class Task2Node(RobotCommander):
         self._cell_seen: str | None = None
         self._red_cell_pose: PoseStamped | None = None
         self._green_cell_pose: PoseStamped | None = None
+        # Per-frame line-follow targets used to orient along the cell stripe
+        # during anomaly inspection (base_link-frame PoseStamped).
+        self._red_target: PoseStamped | None = None
+        self._green_target: PoseStamped | None = None
+        self._last_red_target_at = 0.0
+        self._last_green_target_at = 0.0
+
+        # Blue-search spin state: when blue line is lost while heading to
+        # CTO, we spin alternately to re-acquire instead of just pausing.
+        self._blue_search_attempts = 0
+
+        # Latest LaserScan, used by _scoot_to_belt during anomaly inspection.
+        self._last_scan: LaserScan | None = None
 
         # Detector beliefs (populated from marker topics).
         self.barrels: dict[int, dict] = {}     # barrel id -> dict from /barrel_inspections
@@ -133,17 +157,45 @@ class Task2Node(RobotCommander):
         self.report = InspectionReport(robot_name='R2D2')
 
         self.declare_parameters('', [
-            ('declare_first_room_only', True),
+            # False = after coverage + all tasks done, EXIT_FIRST_ROOM →
+            # FOLLOW_BLUE → CTO → DONE. True = stop after first room.
+            ('declare_first_room_only', False),
             ('exit_x', EXIT_FIRST_ROOM_GOAL[0]),
             ('exit_y', EXIT_FIRST_ROOM_GOAL[1]),
             ('exit_yaw_deg', EXIT_FIRST_ROOM_GOAL[2]),
-            ('cell_red_xy', ''),
-            ('cell_green_xy', ''),
+            # Cell entrance fallbacks (x, y, yaw_deg) used when
+            # line_detection hasn't published a live pose yet. Overridable
+            # at launch with `-p cell_red_xy:='4,0,90'` etc.
+            ('cell_red_xy',   '-4.5,0,-90'),
+            ('cell_green_xy', '-4.4,-2,-180'),
+            # Hardcoded start/end of each colored stripe in MAP frame.
+            # Read with RViz "Publish Point" tool. Format: 'x,y'.
+            # Inspection: Nav2 to start (facing end), arm out, drive forward.
+            ('cell_red_start_xy',    '0.21,-4.90'),
+            ('cell_red_end_xy',     '-1.65,-4.90'),
+            ('cell_green_start_xy', '-4.85,-2.37'),
+            ('cell_green_end_xy',   '-4.85, 0.12'),
+            # Yellow-bounded first room. Coverage waypoints get clipped to
+            # this AABB so exploration never wanders past the yellow lines.
+            ('first_room_x_min', -4.5),
+            ('first_room_x_max',  1.4),
+            ('first_room_y_min', -4.5),
+            ('first_room_y_max',  0.7),
+            # Re-entry pose into the first room after each CTO report.
+            # Just inside x_max, same y as the exit, facing back west into
+            # the room (exit is at +x, room is at -x from there).
+            ('reentry_x', 1.0),
+            ('reentry_y', -0.5),
+            ('reentry_yaw_deg', 180.0),
         ])
 
         # Subscriptions
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, _MAP_QOS)
-        self.create_subscription(MarkerArray,   '/people_markers', self._people_marker_cb, 10)
+        # /people_markers uses TRANSIENT_LOCAL on the publisher (detect_people)
+        # so late-joining task2 still picks up faces confirmed before this
+        # subscription was set up. Must match the publisher's QoS.
+        self.create_subscription(MarkerArray,   '/people_markers',
+                                 self._people_marker_cb, _MAP_QOS)
         self.create_subscription(MarkerArray,   '/barrel_markers', self._barrel_marker_cb, 10)
         self.create_subscription(String,        '/barrel_inspections', self._barrel_json_cb, 10)
         self.create_subscription(MarkerArray,   '/ring_markers',  self._ring_marker_cb, 10)
@@ -155,8 +207,15 @@ class Task2Node(RobotCommander):
                                  self._red_cell_pose_cb, 10)
         self.create_subscription(PoseStamped,   '/lines/green_cell_pose',
                                  self._green_cell_pose_cb, 10)
+        # Per-frame "follow this line" targets used during anomaly inspection.
+        self.create_subscription(PoseStamped,   '/lines/red_target',
+                                 self._red_target_cb, 10)
+        self.create_subscription(PoseStamped,   '/lines/green_target',
+                                 self._green_target_cb, 10)
         self.create_subscription(String,        '/recognized_people',  self._known_people_cb, 10)
         self.create_subscription(String,        '/dialogue/intent',    self._dialogue_intent_cb, 10)
+        self.create_subscription(LaserScan,     '/scan',               self._scan_cb,
+                                 qos_profile_sensor_data)
 
         # Publishers
         # Direct cmd_vel for the safety backup + belt sweep (Nav2 owns /cmd_vel_nav).
@@ -201,8 +260,11 @@ class Task2Node(RobotCommander):
 
         for fid, pos in positions.items():
             if fid in self.known_faces:
-                # Update the position in case the detector refined it.
+                # Refresh position.
                 self.known_faces[fid]['pos'] = pos
+                # Race fix: if /recognized_people landed first and added the
+                # face to known_faces without queueing, queue it now.
+                self._enqueue_if_pending(fid, self.known_faces[fid]['name'])
                 continue
 
             ident = identities.get(fid) or {}
@@ -217,18 +279,43 @@ class Task2Node(RobotCommander):
                     name = m.group('name').lower()
                     role = m.group('role').lower()
 
-            if not name:
-                # Skip unrecognised faces — Task 2 only acts on named workers.
-                continue
+            recognised = bool(name)
+            if not recognised:
+                # Spec p.15 shortcut: approach unrecognised faces too,
+                # using a fid-based placeholder so the dedup logic still
+                # works. Dialogue defaults to neutral phrasing.
+                name = f'worker_{fid}'
 
-            self.known_faces[fid] = {'pos': pos, 'name': name, 'role': role, 'gender': gender}
-            if name == CTO_NAME:
+            self.known_faces[fid] = {'pos': pos, 'name': name, 'role': role,
+                                      'gender': gender, 'recognised': recognised}
+            if recognised and name == CTO_NAME:
                 self._cto_face_id = fid
                 self.info(f'CTO ({name}) registered as face #{fid}.')
-            if fid in self.greeted_ids or name in self.greeted_names:
-                continue
-            self.to_greet.append(fid)
-            self.info(f'New worker {name} ({role}) queued at face #{fid}.')
+            tag = name if recognised else f'unknown face #{fid}'
+            self._enqueue_if_pending(fid, name, log_tag=f'{tag} ({role or "?"})')
+
+    def _enqueue_if_pending(self, fid: int, name: str | None,
+                             log_tag: str | None = None) -> None:
+        """Queue this face for approach unless already greeted / queued."""
+        if not name:
+            self.info(f'Skipping face #{fid}: no name yet.')
+            return
+        if fid in self.greeted_ids:
+            return
+        # Closes the race between popleft() in APPROACH_PERSON and
+        # greeted_ids.add() in DIALOGUE: while the robot is mid-approach
+        # the face is in neither container, so without this guard a fresh
+        # marker would re-queue it and we'd visit the same face twice.
+        if self._current_face_id == fid:
+            return
+        if name in self.greeted_names:
+            self.info(f'Skipping face #{fid} ({name}): name already greeted.')
+            return
+        if fid in self.to_greet:
+            return
+        self.to_greet.append(fid)
+        self.info(f'Queued for approach: {log_tag or f"face #{fid} ({name})"} '
+                  f'(state={self.state.name}, queue={len(self.to_greet)})')
 
     def _yellow_cb(self, msg: Bool) -> None:
         self._yellow_alert = bool(msg.data)
@@ -239,11 +326,22 @@ class Task2Node(RobotCommander):
         self._blue_target = msg
         self._last_blue_target_at = time.monotonic()
 
+    def _scan_cb(self, msg: LaserScan) -> None:
+        self._last_scan = msg
+
     def _cell_cb(self, msg: String) -> None:
         self._cell_seen = msg.data
 
     def _red_cell_pose_cb(self, msg: PoseStamped) -> None:
         self._red_cell_pose = msg
+
+    def _red_target_cb(self, msg: PoseStamped) -> None:
+        self._red_target = msg
+        self._last_red_target_at = time.monotonic()
+
+    def _green_target_cb(self, msg: PoseStamped) -> None:
+        self._green_target = msg
+        self._last_green_target_at = time.monotonic()
 
     def _green_cell_pose_cb(self, msg: PoseStamped) -> None:
         self._green_cell_pose = msg
@@ -317,6 +415,9 @@ class Task2Node(RobotCommander):
                 }
                 if name == CTO_NAME:
                     self._cto_face_id = fid
+            # Always try to queue — if /recognized_people arrives before
+            # /people_markers, this is what triggers the approach.
+            self._enqueue_if_pending(fid, name, log_tag=f'{name} (via /recognized_people)')
 
     # ---- Coverage path generation (lifted from task1.py) -------------------
 
@@ -330,10 +431,21 @@ class Task2Node(RobotCommander):
         step = max(1, int(COVERAGE_SPACING / res))
         clearance = max(1, int(ROBOT_CLEARANCE / res))
 
+        # Yellow-bounded first room AABB. Cells outside this box are skipped
+        # so the autonomous coverage path stays inside the yellow lines.
+        rx_min = float(self.get_parameter('first_room_x_min').get_parameter_value().double_value)
+        rx_max = float(self.get_parameter('first_room_x_max').get_parameter_value().double_value)
+        ry_min = float(self.get_parameter('first_room_y_min').get_parameter_value().double_value)
+        ry_max = float(self.get_parameter('first_room_y_max').get_parameter_value().double_value)
+
         waypoints: list[tuple[float, float]] = []
 
         def cell_ok(iy: int, ix: int) -> bool:
             if data[iy, ix] != 0:
+                return False
+            wx = ox + ix * res
+            wy = oy + iy * res
+            if not (rx_min <= wx <= rx_max and ry_min <= wy <= ry_max):
                 return False
             r = clearance
             patch = data[max(0, iy - r):iy + r + 1,
@@ -408,7 +520,8 @@ class Task2Node(RobotCommander):
                 return r * res
         return float('inf')
 
-    def _approach_pose(self, fx: float, fy: float) -> PoseStamped:
+    def _approach_pose(self, fx: float, fy: float,
+                        distance: float = APPROACH_DIST) -> PoseStamped:
         if hasattr(self, 'current_pose') and self.current_pose is not None:
             rx = self.current_pose.pose.position.x
             ry = self.current_pose.pose.position.y
@@ -421,8 +534,8 @@ class Task2Node(RobotCommander):
         best_ax, best_ay, best_clear = None, None, -1.0
         for i in range(12):
             angle = base_angle + i * (math.pi / 6)
-            ax = fx + math.cos(angle) * APPROACH_DIST
-            ay = fy + math.sin(angle) * APPROACH_DIST
+            ax = fx + math.cos(angle) * distance
+            ay = fy + math.sin(angle) * distance
             c = self._clearance_at(ax, ay)
             if c > best_clear:
                 best_clear = c
@@ -527,6 +640,10 @@ class Task2Node(RobotCommander):
     def run(self) -> None:
         self.waitUntilNav2Active()
 
+        # Park the arm folded back ('garage') so it isn't sticking out
+        # during navigation — only the anomaly inspection extends it.
+        self._arm('garage')
+
         self.info('Waiting for /map to build coverage path...')
         while not self.coverage_waypoints and rclpy.ok():
             self._spin_ros(0.1)
@@ -554,11 +671,28 @@ class Task2Node(RobotCommander):
                 if self.to_greet:
                     self.state = State.APPROACH_PERSON
                     continue
+                # Primary exit condition: all workers greeted. Task count
+                # doesn't matter — some workers may decline ('nothing').
+                if len(self.greeted_ids) >= FACES_TO_VISIT:
+                    self.info(f'All {FACES_TO_VISIT} workers visited '
+                              f'({self._tasks_executed} tasks ran) — '
+                              'leaving first room for CTO report.')
+                    if first_room_only:
+                        self.state = State.DONE
+                    else:
+                        self.state = State.EXIT_FIRST_ROOM
+                    continue
                 if self.waypoint_idx >= len(self.coverage_waypoints):
                     if first_room_only:
-                        # Path exhausted, no more workers — wrap up.
+                        # Path exhausted with fewer than N faces — give up.
+                        self.warn(f'Coverage exhausted but only '
+                                  f'{len(self.greeted_ids)}/{FACES_TO_VISIT} '
+                                  f'faces visited; finishing anyway.')
                         self.state = State.DONE
                         continue
+                    self.warn(f'Coverage exhausted but only '
+                              f'{len(self.greeted_ids)}/{FACES_TO_VISIT} '
+                              f'faces visited; heading to CTO anyway.')
                     self.state = State.EXIT_FIRST_ROOM
                     continue
 
@@ -566,8 +700,21 @@ class Task2Node(RobotCommander):
                 self.info(f'Coverage waypoint {self.waypoint_idx + 1}/'
                           f'{len(self.coverage_waypoints)}: ({wp[0]:.2f}, {wp[1]:.2f})')
                 self._go_waypoint(*wp)
-                ok = self._wait_nav_with_safety()
-                if ok or not self._yellow_alert:
+
+                # Interrupt the coverage leg the moment a known face is queued
+                # — _wait_nav_with_safety only watches yellow_alert.
+                interrupted_by_face = False
+                while not self.isTaskComplete():
+                    self._spin_ros()
+                    if self._check_yellow_safety():
+                        break
+                    if self.to_greet:
+                        self.info('Face spotted mid-leg — cancelling coverage to greet.')
+                        self.cancelTask()
+                        interrupted_by_face = True
+                        break
+
+                if not interrupted_by_face and not self._yellow_alert:
                     self.waypoint_idx += 1
 
             elif self.state == State.APPROACH_PERSON:
@@ -575,16 +722,49 @@ class Task2Node(RobotCommander):
                     self.state = State.EXPLORE_FIRST_ROOM
                     continue
                 fid = self.to_greet.popleft()
+                # Defensive: if a stale entry somehow lingers in to_greet
+                # (e.g. older code revision had a race), don't re-greet.
+                if fid in self.greeted_ids:
+                    self.info(f'Face #{fid} already greeted; skipping.')
+                    self.state = State.EXPLORE_FIRST_ROOM
+                    continue
                 self._current_face_id = fid
                 face = self.known_faces[fid]
                 fx, fy, _ = face['pos']
-                self.info(f'Approaching {face["name"]} ({face["role"]}) at ({fx:.2f}, {fy:.2f})')
-                self.goToPose(self._approach_pose(fx, fy))
+                attempt = self._approach_retries.get(fid, 0) + 1
+                # Back off 0.2 m per failed attempt so a face in a tight
+                # corner eventually gets a reachable approach pose.
+                dist = APPROACH_DIST + 0.2 * (attempt - 1)
+                # Diagnostic so we can tell when the approach pose was
+                # already inside Nav2's xy_goal_tolerance (= robot skips
+                # the visible drive and goes straight to dialogue).
+                rx_dbg = ry_dbg = 0.0
+                if self.current_pose is not None:
+                    rx_dbg = self.current_pose.pose.position.x
+                    ry_dbg = self.current_pose.pose.position.y
+                face_dist = math.hypot(fx - rx_dbg, fy - ry_dbg)
+                approach_pose = self._approach_pose(fx, fy, distance=dist)
+                ap_x = approach_pose.pose.position.x
+                ap_y = approach_pose.pose.position.y
+                gap = math.hypot(ap_x - rx_dbg, ap_y - ry_dbg)
+                self.info(
+                    f'Approaching {face["name"]} ({face["role"]}) — '
+                    f'face=({fx:.2f},{fy:.2f}) robot=({rx_dbg:.2f},{ry_dbg:.2f}) '
+                    f'face_dist={face_dist:.2f}m '
+                    f'approach=({ap_x:.2f},{ap_y:.2f}) '
+                    f'gap_to_approach={gap:.2f}m (nav2 xy tol=0.22m) '
+                    f'attempt={attempt} stand-off={dist:.2f}m')
+                self.goToPose(approach_pose)
                 if self._wait_nav_with_safety():
+                    self._approach_retries.pop(fid, None)
                     self._face_person(fx, fy)
                     self.state = State.DIALOGUE
                 else:
-                    # Re-queue and try again later.
+                    # Re-queue at the END so other faces get tried first.
+                    self._approach_retries[fid] = attempt
+                    self.warn(
+                        f'Approach to face #{fid} failed (attempt {attempt}); '
+                        f're-queued — will retry after other work.')
                     self.to_greet.append(fid)
                     self.state = State.EXPLORE_FIRST_ROOM
 
@@ -612,33 +792,69 @@ class Task2Node(RobotCommander):
             elif self.state == State.EXECUTE_TASK:
                 intent = self._chosen_task
                 requestor = self._chosen_task_requestor or 'unknown'
+                task_was_run = False
                 if intent == 'barrels':
                     self._run_barrel_inspection(requestor)
+                    task_was_run = True
                 elif intent == 'rings':
                     self._run_ring_counting(requestor)
+                    task_was_run = True
                 elif intent == 'anomaly_red':
                     self._run_anomaly_inspection('red', requestor)
+                    task_was_run = True
                 elif intent == 'anomaly_green':
                     self._run_anomaly_inspection('green', requestor)
+                    task_was_run = True
                 else:
                     self.info(f'EXECUTE_TASK: unrecognised intent {intent!r}; skipping.')
+                if task_was_run:
+                    self._tasks_executed += 1
+                    self.info(f'Tasks executed: {self._tasks_executed}; '
+                              f'faces greeted: {len(self.greeted_ids)}/{FACES_TO_VISIT}.')
                 self._chosen_task = None
                 self._chosen_task_requestor = None
+                # Batched flow: finish all worker tasks first, then ONE CTO
+                # trip at the end. Always go back to exploration after a task.
                 self.state = State.EXPLORE_FIRST_ROOM
 
             elif self.state == State.EXIT_FIRST_ROOM:
+                # Catch late-discovered faces before committing to CTO trip.
+                if self.to_greet:
+                    self.info(f'Late face queued ({len(self.to_greet)}); '
+                              f'handling before exit.')
+                    self.state = State.APPROACH_PERSON
+                    continue
                 ex = float(self.get_parameter('exit_x').get_parameter_value().double_value)
                 ey = float(self.get_parameter('exit_y').get_parameter_value().double_value)
                 eyaw = float(self.get_parameter('exit_yaw_deg').get_parameter_value().double_value)
-                self.info(f'Heading to exit ({ex:.2f}, {ey:.2f})')
+                self.info(f'All worker tasks done — heading to exit ({ex:.2f}, {ey:.2f}) for CTO.')
                 self._go_waypoint(ex, ey, eyaw)
-                if self._wait_nav_with_safety():
-                    self.state = State.FOLLOW_BLUE_LINE
-                else:
-                    # Try once more on safety stop.
+                interrupted_by_face = False
+                while not self.isTaskComplete():
+                    self._spin_ros()
+                    if self._check_yellow_safety():
+                        break
+                    if self.to_greet:
+                        self.info('Face spotted on the way out — handling first.')
+                        self.cancelTask()
+                        interrupted_by_face = True
+                        break
+                if interrupted_by_face:
+                    self.state = State.APPROACH_PERSON
+                elif self._yellow_alert:
                     self.state = State.EXIT_FIRST_ROOM
+                else:
+                    self.state = State.FOLLOW_BLUE_LINE
 
             elif self.state == State.FOLLOW_BLUE_LINE:
+                # A face confirmed after leaving the first room still needs a
+                # greeting + dialogue. "If not doing task" → preempt FOLLOW.
+                if self.to_greet:
+                    self.info(f'Face queued during FOLLOW_BLUE_LINE '
+                              f'({len(self.to_greet)}); handling first.')
+                    self.cancelTask()
+                    self.state = State.APPROACH_PERSON
+                    continue
                 if self._cto_face_id is not None and self._cto_face_id in self.known_faces:
                     self.info('CTO already in sight – approaching.')
                     self.state = State.REPORT_TO_CTO
@@ -646,9 +862,10 @@ class Task2Node(RobotCommander):
 
                 if (self._blue_target is None or
                         time.monotonic() - self._last_blue_target_at > BLUE_FOLLOW_TIMEOUT):
-                    self.warn('Lost the blue line — pausing.')
-                    self._spin_ros(0.5)
+                    self._search_for_blue_line()
                     continue
+                # Got the line back — reset the search counter.
+                self._blue_search_attempts = 0
 
                 # Convert the latest base_link target into a map-frame goal so Nav2 can plan to it.
                 target = self._latest_blue_goal_in_map()
@@ -660,6 +877,12 @@ class Task2Node(RobotCommander):
                 while not self.isTaskComplete() and rclpy.ok():
                     self._spin_ros(0.1)
                     if self._check_yellow_safety():
+                        break
+                    if self.to_greet:
+                        self.info('Face spotted while following blue line — '
+                                  'cancelling to greet.')
+                        self.cancelTask()
+                        self.state = State.APPROACH_PERSON
                         break
                     if (self._cto_face_id is not None and
                             self._cto_face_id in self.known_faces):
@@ -680,6 +903,8 @@ class Task2Node(RobotCommander):
                 self.goToPose(self._approach_pose(fx, fy))
                 self._wait_nav_with_safety()
                 self._face_person(fx, fy)
+
+                # End-of-run: deliver the aggregated inspection report.
                 self._finalize_report()
                 self._say('Inspection report ready, sir.')
                 self.state = State.DONE
@@ -734,7 +959,9 @@ class Task2Node(RobotCommander):
             return
         rx = self.current_pose.pose.position.x
         ry = self.current_pose.pose.position.y
-        target_yaw = math.atan2(fy - ry, fx - rx)
+        # Aim slightly left of the face so the QR card (to the left of the
+        # worker from the camera's POV) enters frame too.
+        target_yaw = math.atan2(fy - ry, fx - rx) + math.radians(FACE_YAW_BIAS_DEG)
         cur_yaw = self._current_yaw()
         if cur_yaw is None:
             return
@@ -860,28 +1087,85 @@ class Task2Node(RobotCommander):
         return None
 
     def _run_anomaly_inspection(self, cell_colour: str, requestor: str) -> None:
-        pose = self._resolve_cell_pose(cell_colour)
-        if pose is None:
-            self._say(f'I do not know where the {cell_colour} cell is.')
+        # Read hardcoded start/end points (map frame).
+        start_xy = self._parse_xy_param(f'cell_{cell_colour}_start_xy')
+        end_xy   = self._parse_xy_param(f'cell_{cell_colour}_end_xy')
+        if start_xy is None or end_xy is None:
+            self._say(f'I do not know where the {cell_colour} stripe is.')
             self.report.add_execution(requestor, f'anomaly_{cell_colour}', [])
             return
 
-        self.info(f'Driving to {cell_colour} cell.')
-        self.goToPose(pose)
+        sx, sy = start_xy
+        ex, ey = end_xy
+        drive_yaw = math.atan2(ey - sy, ex - sx)
+        stripe_len = math.hypot(ex - sx, ey - sy)
+        self.info(f'{cell_colour} stripe: start=({sx:.2f},{sy:.2f}) '
+                  f'end=({ex:.2f},{ey:.2f}) yaw={math.degrees(drive_yaw):.1f}° '
+                  f'length={stripe_len:.2f} m')
+
+        # 1) STOP AT START POINT. Nav2 navigates to the start; goal yaw is
+        #    set to drive_yaw so Nav2 will try to leave us already facing
+        #    the end, but we do an explicit spin in step 2 to guarantee
+        #    alignment regardless of how Nav2 finishes.
+        start_pose = PoseStamped()
+        start_pose.header.frame_id = 'map'
+        start_pose.header.stamp = self.get_clock().now().to_msg()
+        start_pose.pose.position.x = sx
+        start_pose.pose.position.y = sy
+        start_pose.pose.orientation = self.YawToQuaternion(drive_yaw)
+        self.info(f'Driving to {cell_colour} stripe start.')
+        self.goToPose(start_pose)
         if not self._wait_nav_with_safety():
             self.report.add_execution(requestor, f'anomaly_{cell_colour}', [])
             return
 
-        # Clear out tiles from any previous run so we report only this cell.
+        # 2) YAW TOWARD END POINT. Explicit spin so the robot is guaranteed
+        #    to face along the stripe before the arm comes out.
+        cur_yaw = self._current_yaw() or 0.0
+        delta = math.atan2(math.sin(drive_yaw - cur_yaw),
+                           math.cos(drive_yaw - cur_yaw))
+        self.info(f'Yawing toward end of {cell_colour} stripe '
+                  f'(delta={math.degrees(delta):.1f}°).')
+        if abs(delta) > math.radians(2):
+            self.spin(spin_dist=float(delta), time_allowance=8)
+            while not self.isTaskComplete() and rclpy.ok():
+                self._spin_ros(0.05)
+        # Brief settle.
+        settle_deadline = time.monotonic() + 0.4
+        while time.monotonic() < settle_deadline and rclpy.ok():
+            self._spin_ros(0.05)
+
+        # Clear tiles from any previous run so we report only this cell.
         self.tiles.clear()
 
-        # Sweep the conveyor belt with the wrist camera.
+        # 3) EXTEND ARM toward the tiles. arm_mover_actions has a 1 Hz
+        #    timer + 3 s trajectory `time_from_start`, so each pose
+        #    change can take ~4 s end-to-end. Wait 4 s after `up` and
+        #    5 s after `look_at_belt_left` so the arm is FULLY in the
+        #    scanning position before the robot starts moving.
         self._arm('up')
-        time.sleep(0.5)
+        time.sleep(4.0)
         self._arm('look_at_belt_left')
-        self._belt_sweep(distance=BELT_SWEEP_DIST, velocity=BELT_SWEEP_VEL)
-        self._arm('look_at_belt_right')
-        self._belt_sweep(distance=BELT_SWEEP_DIST, velocity=-BELT_SWEEP_VEL)
+        time.sleep(9.0)
+
+        # 4) DRIVE TO END POINT via cmd_vel — straight line guaranteed.
+        #    Nav2 would curve to dodge nearby obstacles even when the
+        #    direct path is clear. The tight goal tolerance in step 1
+        #    plus the explicit spin in step 2 ensure we start exactly
+        #    on the stripe facing the right way, so open-loop forward
+        #    drive stays on the line. anomaly_detector keeps populating
+        #    self.tiles in the background while we travel.
+        self._drive_distance(stripe_len, velocity=BELT_SWEEP_VEL,
+                              cell_colour=cell_colour)
+
+        # Hold the arm in place for 3 s so anomaly_detector gets a few
+        # extra frames of the final tile (otherwise the last tile can be
+        # missed because the robot moved past it just as it locked).
+        self.info('Stripe end reached; holding 3 s for last-tile lock.')
+        end_settle = time.monotonic() + 3.0
+        while time.monotonic() < end_settle and rclpy.ok():
+            self._spin_ros(0.1)
+
         self._arm('garage')
 
         # Snapshot into the report.
@@ -893,6 +1177,247 @@ class Task2Node(RobotCommander):
         anomalous = sum(1 for t in results if t.anomalous)
         self._say(f'Inspected {len(results)} tiles in the {cell_colour} cell. '
                   f'{anomalous} appear damaged.')
+
+    def _parse_xy_param(self, name: str) -> tuple[float, float] | None:
+        raw = self.get_parameter(name).get_parameter_value().string_value
+        try:
+            parts = [float(p.strip()) for p in raw.split(',')]
+            if len(parts) >= 2:
+                return parts[0], parts[1]
+        except ValueError:
+            pass
+        self.warn(f'Bad parameter {name}={raw!r}; expected "x,y".')
+        return None
+
+    def _drive_distance(self, target_distance: float, velocity: float,
+                         cell_colour: str | None = None,
+                         max_time: float | None = None) -> None:
+        """Open-loop forward drive of `target_distance` metres in map frame.
+
+        Sole stop condition is the measured map-frame distance travelled
+        (per the user's spec: don't rely on lidar / yellow alert here).
+        `max_time` defaults to `target_distance / velocity * 3 + 10` so
+        the watchdog scales with stripe length and we never time out on
+        a long stripe.
+        """
+        if self.current_pose is None:
+            self.warn('No current_pose; cannot drive distance.')
+            return
+        if velocity <= 0:
+            return
+        if max_time is None:
+            max_time = target_distance / velocity * 3.0 + 10.0
+
+        start_x = self.current_pose.pose.position.x
+        start_y = self.current_pose.pose.position.y
+
+        twist = TwistStamped()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = velocity
+        deadline = time.monotonic() + max_time
+        while time.monotonic() < deadline and rclpy.ok():
+            twist.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_vel_pub.publish(twist)
+            self._spin_ros(0.05)
+            travelled = math.hypot(
+                self.current_pose.pose.position.x - start_x,
+                self.current_pose.pose.position.y - start_y)
+            if travelled >= target_distance:
+                self.info(f'Reached stripe end '
+                          f'({travelled:.2f} m / {target_distance:.2f} m).')
+                break
+        else:
+            travelled = math.hypot(
+                self.current_pose.pose.position.x - start_x,
+                self.current_pose.pose.position.y - start_y)
+            self.warn(f'Drive timed out after {max_time:.1f} s '
+                      f'({travelled:.2f} m / {target_distance:.2f} m).')
+        twist.twist.linear.x = 0.0
+        twist.header.stamp = self.get_clock().now().to_msg()
+        self.cmd_vel_pub.publish(twist)
+
+    def _search_for_blue_line(self) -> None:
+        """Spin to re-acquire the blue line.
+
+        Alternates direction and grows the arc each attempt so a full
+        circle is swept in ~3 tries. Stops as soon as a fresh
+        /lines/blue_target arrives (the callback runs during _spin_ros).
+        """
+        self._blue_search_attempts += 1
+        n = self._blue_search_attempts
+        # 1st: 90° left, 2nd: 180° right, 3rd: 270° left, then loop.
+        sign = 1.0 if n % 2 == 1 else -1.0
+        magnitude = math.radians(min(90 * n, 270))
+        spin_amt = sign * magnitude
+        self.warn(f'Lost blue line — search spin {n} '
+                  f'({math.degrees(spin_amt):+.0f}°).')
+        self.spin(spin_dist=float(spin_amt), time_allowance=8)
+        deadline = time.monotonic() + 8.0
+        while not self.isTaskComplete() and time.monotonic() < deadline and rclpy.ok():
+            self._spin_ros(0.1)
+            if self._check_yellow_safety():
+                self.cancelTask()
+                return
+            # Early exit the moment line_detection publishes a fresh target.
+            if (self._last_blue_target_at > 0 and
+                    time.monotonic() - self._last_blue_target_at < 0.5):
+                self.info('Blue line re-acquired during search.')
+                self.cancelTask()
+                return
+
+    def _front_lidar_distance(self, half_arc_deg: float = 12.0) -> float | None:
+        """Closest lidar return in a small cone straight ahead, or None."""
+        scan = self._last_scan
+        if scan is None or not scan.ranges:
+            return None
+        half_arc = math.radians(half_arc_deg)
+        n = len(scan.ranges)
+        a0 = scan.angle_min
+        da = scan.angle_increment
+        min_d = float('inf')
+        for i in range(n):
+            angle = a0 + i * da
+            # Normalise to [-pi, pi] just in case.
+            angle = math.atan2(math.sin(angle), math.cos(angle))
+            if abs(angle) > half_arc:
+                continue
+            r = scan.ranges[i]
+            if scan.range_min <= r <= scan.range_max and math.isfinite(r):
+                if r < min_d:
+                    min_d = r
+        return min_d if min_d < float('inf') else None
+
+    def _scoot_to_belt(self, target_distance: float = 0.25,
+                        max_advance_s: float = 20.0) -> None:
+        """Open-loop creep forward until lidar reads `target_distance` ahead.
+
+        Run after `goToPose(cell_pose)` puts the robot facing the belt.
+        Bounded by max_advance_s so we never wander far if lidar misses.
+        Default tuned for the case where the hardcoded approach pose
+        leaves the robot up to ~2 m from the belt edge.
+        """
+        # Wait briefly for a fresh scan.
+        wait_deadline = time.monotonic() + 1.5
+        while self._last_scan is None and time.monotonic() < wait_deadline and rclpy.ok():
+            self._spin_ros(0.1)
+        if self._last_scan is None:
+            self.warn('Lidar silent — skipping belt scoot.')
+            return
+
+        twist = TwistStamped()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = 0.27  # creep, but fast enough to close 2 m in time
+        deadline = time.monotonic() + max_advance_s
+        publish_rate = 0.05
+        while time.monotonic() < deadline and rclpy.ok():
+            self._spin_ros(publish_rate)
+            if self._check_yellow_safety():
+                break
+            d = self._front_lidar_distance()
+            if d is not None and d <= target_distance:
+                self.info(f'Belt close enough (lidar={d:.2f} m).')
+                break
+            twist.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_vel_pub.publish(twist)
+        # Hard stop.
+        twist.twist.linear.x = 0.0
+        twist.header.stamp = self.get_clock().now().to_msg()
+        self.cmd_vel_pub.publish(twist)
+
+    def _approach_cell_line(self, cell_colour: str,
+                             stop_ahead: float = 0.05,
+                             max_advance_s: float = 12.0) -> None:
+        """Creep forward until the red/green stripe is `stop_ahead` m in front.
+
+        Uses /lines/{red,green}_target (base_link frame). The published pose
+        is foot + 0.5 m along the fitted-line direction, so we recover the
+        foot (closest point on the line to the robot) and watch its forward
+        component. Stops on yellow safety or when lidar reports an obstacle
+        closer than `stop_ahead`, whichever fires first.
+        """
+        target_attr = '_red_target' if cell_colour == 'red' else '_green_target'
+        seen_attr   = '_last_red_target_at' if cell_colour == 'red' else '_last_green_target_at'
+        LOOKAHEAD = 0.5  # must match line_detection._publish_line_target
+
+        twist = TwistStamped()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = 0.27  # 1.5x of original creep
+        deadline = time.monotonic() + max_advance_s
+        publish_rate = 0.05
+        line_ever_seen = False
+
+        while time.monotonic() < deadline and rclpy.ok():
+            self._spin_ros(publish_rate)
+            if self._check_yellow_safety():
+                break
+
+            target: PoseStamped | None = getattr(self, target_attr)
+            last_at = getattr(self, seen_attr)
+            line_fresh = (target is not None
+                          and last_at > 0
+                          and time.monotonic() - last_at < 0.5)
+
+            if line_fresh:
+                line_ever_seen = True
+                q = target.pose.orientation
+                yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                foot_x = target.pose.position.x - LOOKAHEAD * math.cos(yaw)
+                # foot_x is "metres ahead of robot to the line".
+                if foot_x <= stop_ahead:
+                    self.info(f'At {cell_colour} stripe (foot_x={foot_x:.2f} m).')
+                    break
+
+            # Lidar safety / fallback for when the line is briefly lost or
+            # not yet acquired. Barrel-radius bound = stop_ahead + clearance.
+            d = self._front_lidar_distance()
+            if d is not None and d <= max(stop_ahead, 0.30):
+                if line_ever_seen:
+                    self.info(f'Lidar stop at {d:.2f} m (line momentarily lost).')
+                else:
+                    self.warn(f'No {cell_colour} stripe seen yet; lidar stop at {d:.2f} m.')
+                break
+
+            twist.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_vel_pub.publish(twist)
+
+        # Hard stop.
+        twist.twist.linear.x = 0.0
+        twist.header.stamp = self.get_clock().now().to_msg()
+        self.cmd_vel_pub.publish(twist)
+
+    def _align_to_cell_line(self, cell_colour: str, timeout_s: float = 4.0) -> None:
+        """Spin in place so the robot's forward axis matches the cell line.
+
+        Waits up to `timeout_s` for line_detection to publish a fresh
+        red/green target, then spins by the target's yaw (target is in
+        base_link frame, so its yaw == the delta to apply).
+        """
+        target_attr = '_red_target' if cell_colour == 'red' else '_green_target'
+        seen_attr   = '_last_red_target_at' if cell_colour == 'red' else '_last_green_target_at'
+        # Force a fresh target — anything older than 1 s is stale.
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and rclpy.ok():
+            last_at = getattr(self, seen_attr)
+            if last_at > 0 and time.monotonic() - last_at < 1.0:
+                break
+            self._spin_ros(0.1)
+        target: PoseStamped | None = getattr(self, target_attr)
+        if target is None:
+            self.warn(f'No {cell_colour} target seen; sweeping with hardcoded yaw.')
+            return
+        q = target.pose.orientation
+        # base_link-frame yaw = delta to spin (forward axis is already X).
+        delta = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        if abs(delta) < math.radians(3):
+            return
+        self.info(f'Aligning to {cell_colour} line by {math.degrees(delta):.1f}°.')
+        self.spin(spin_dist=float(delta), time_allowance=5)
+        while not self.isTaskComplete():
+            self._spin_ros()
+            if self._check_yellow_safety():
+                return
 
     def _belt_sweep(self, distance: float, velocity: float) -> None:
         if velocity == 0:

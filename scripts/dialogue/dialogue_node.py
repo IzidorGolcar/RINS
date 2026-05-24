@@ -108,13 +108,22 @@ class DialogueNode(Node):
         self.bridge = CvBridge()
         self.create_subscription(String, '/dialogue/prompt', self._prompt_cb, 10)
         self.create_subscription(String, '/dialogue/say',    self._say_cb,    10)
-        self.create_subscription(Image, '/top_camera/rgb/preview/image_raw',
-                                 self._img_cb, qos_profile_sensor_data)
+        # Subscribe to BOTH cameras. OAK-D is preferred for QR fallback
+        # because it's already pointed at the worker after task2's approach
+        # spin; only when it fails do we go through the slow arm-camera path.
+        self.create_subscription(
+            Image, '/oakd/rgb/preview/image_raw',
+            lambda msg: self._img_cb(msg, 'oakd'),
+            qos_profile_sensor_data)
+        self.create_subscription(
+            Image, '/top_camera/rgb/preview/image_raw',
+            lambda msg: self._img_cb(msg, 'top'),
+            qos_profile_sensor_data)
         self.intent_pub = self.create_publisher(String, '/dialogue/intent', 10)
         self.arm_cmd_pub = self.create_publisher(String, '/arm_command', 10)
 
         # ---- State
-        self._latest_image: Optional[np.ndarray] = None
+        self._latest_images: dict[str, Optional[np.ndarray]] = {'oakd': None, 'top': None}
         self._image_lock = threading.Lock()
 
         # Audio queue (raw int16 bytes from sounddevice callback).
@@ -221,13 +230,13 @@ class DialogueNode(Node):
         # Simple one-off TTS — enqueue as a prompt with expects_intent=False.
         self._prompt_q.put({'text': msg.data, 'expects_intent': False})
 
-    def _img_cb(self, msg: Image) -> None:
+    def _img_cb(self, msg: Image, cam: str) -> None:
         try:
             img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception:
             return
         with self._image_lock:
-            self._latest_image = img
+            self._latest_images[cam] = img
 
     # --------------------------------------------------------- dialogue flow
 
@@ -345,42 +354,58 @@ class DialogueNode(Node):
     # --------------------------------------------------------- QR fallback
 
     def _qr_fallback(self) -> tuple[Optional[str], str, str]:
-        """Last-resort: point the wrist camera at the QR code and decode it."""
+        """QR fallback via the forward OAK-D only.
+
+        The OAK-D is already pointed at the worker after task2's approach
+        spin, so the QR card "next to the person" should be in frame. No
+        arm motion needed — saves the ~8 s arm settle + scan + park cycle.
+        """
         if not _ZBAR_OK:
             return None, '', 'timeout'
 
-        self.get_logger().info('Voice failed — trying QR fallback.')
+        self.get_logger().info('Voice failed — scanning OAK-D for QR.')
         self._tts('Let me check the code.')
 
-        self.arm_cmd_pub.publish(String(data='look_for_qr'))
-        time.sleep(QR_ARM_SETTLE_S)
+        intent, payload = self._scan_camera('oakd', window_s=QR_FRAME_WAIT_S)
+        if intent is None:
+            self.get_logger().warn(
+                f'QR fallback: no recognised code on OAK-D '
+                f'(last raw payload seen: {payload!r}).')
+            return None, payload, 'timeout'
+        self.get_logger().info(f'QR via OAK-D: {payload!r} → {intent}')
+        return intent, payload, 'qr'
 
-        deadline = time.monotonic() + QR_FRAME_WAIT_S
-        intent: Optional[str] = None
+    def _scan_camera(self, cam: str, window_s: float) -> tuple[Optional[str], str]:
+        """Poll one camera's latest frame for a known QR payload.
+
+        QR text is run through the same sentence parser as voice STT —
+        spec shows QRs encoding things like "Detect anomalies in the
+        green cell." — and falls back to the short-key dictionary
+        (`qr_barrels` etc.) for backwards compatibility.
+        """
+        deadline = time.monotonic() + window_s
         payload: str = ''
         while time.monotonic() < deadline and rclpy.ok():
             with self._image_lock:
-                img = None if self._latest_image is None else self._latest_image.copy()
+                img = self._latest_images.get(cam)
+                img = img.copy() if img is not None else None
             if img is not None:
                 for code in pyzbar.decode(img):
                     text = code.data.decode('utf-8', errors='ignore').strip()
-                    candidate = classify_qr(text)
+                    if not text:
+                        continue
+                    # 1. Sentence parser (handles full prose).
+                    parsed = classify(text)
+                    candidate = parsed.intent
+                    # 2. Dict-keyed fallback (legacy short QR payloads).
+                    if candidate is None:
+                        candidate = classify_qr(text)
                     if candidate is not None:
-                        intent = candidate
-                        payload = text
-                        break
-                if intent is not None:
-                    break
+                        return candidate, text
+                    if not payload:
+                        payload = text  # keep first unrecognised payload for logging
             time.sleep(0.15)
-
-        # Always park the arm, regardless of outcome.
-        self.arm_cmd_pub.publish(String(data='garage'))
-
-        if intent is None:
-            self.get_logger().warn('QR fallback: no readable code found.')
-            return None, payload, 'timeout'
-        self.get_logger().info(f'QR fallback succeeded: {payload!r} → {intent}')
-        return intent, payload, 'qr'
+        return None, payload
 
     # ------------------------------------------------------------------- TTS
 

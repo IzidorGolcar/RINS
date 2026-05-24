@@ -19,11 +19,18 @@ sudo apt install -y \
     portaudio19-dev          # required by sounddevice for mic capture
 
 # Python packages (use the same Python ROS 2 Jazzy uses)
-pip install --user \
+pip install --user --break-system-packages \
     vosk \
     sounddevice \
     pyzbar \
-    reportlab
+    reportlab \
+    ultralytics \
+    torch \
+    torchvision \
+    facenet-pytorch \
+    'numpy<2'          # ROS Jazzy cv_bridge + system matplotlib are NumPy-1.x ABI
+
+sudo apt install ros-jazzy-turtle-tf2-py
 
 # Vosk English model (small, ~50 MB) — kept out of git, downloaded per machine
 mkdir -p ~/ros2_ws/src/RINS/models

@@ -95,7 +95,10 @@ class FaceDetector(Node):
 
         self.model = YOLO('yolov8n.pt')
 
-        self._load_persisted()
+        # Always start with no confirmed faces — wipe the on-disk cache so
+        # other nodes reading /recognized_people or known_people.json don't
+        # see stale identities from a previous run.
+        self._reset_persisted()
 
         self.get_logger().info(
             'Face detector initialised. '
@@ -379,44 +382,15 @@ class FaceDetector(Node):
 
     # --------------------------------------------------------- persistence
 
-    def _load_persisted(self) -> None:
-        if not self.store_path or not os.path.exists(self.store_path):
-            return
-        try:
-            with open(self.store_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as exc:
-            self.get_logger().warn(f'Could not read {self.store_path}: {exc}')
-            return
-
-        for entry in data.get('faces', []):
-            ident = None
-            if entry.get('name') and self.recognizer is not None:
-                # Look up label_id by name so future votes still merge.
-                for lbl, meta in self.recognizer.people.items():
-                    if meta['name'] == entry['name'] and meta['role'] == entry.get('role'):
-                        ident = Identity(
-                            label_id=lbl,
-                            name=meta['name'],
-                            role=meta['role'],
-                            gender=meta['gender'],
-                            score=float(entry.get('score', 0.0)),
-                        )
-                        break
-            face = {
-                'id': int(entry['id']),
-                'pos': np.array([entry['x'], entry['y'], entry.get('z', 0.0)]),
-                'votes': {} if ident is None else {ident.label_id: ident.score},
-                'identity': ident,
-                'first_seen': entry.get('first_seen',
-                                        datetime.now(timezone.utc).isoformat(timespec='seconds')),
-            }
-            self.confirmed_faces.append(face)
-            self._next_face_id = max(self._next_face_id, face['id'] + 1)
-
-        if self.confirmed_faces:
-            self.get_logger().info(
-                f'Restored {len(self.confirmed_faces)} known faces from {self.store_path}')
+    def _reset_persisted(self) -> None:
+        """Clear any previously persisted faces so each run starts clean."""
+        if self.store_path and os.path.exists(self.store_path):
+            try:
+                os.remove(self.store_path)
+            except OSError as exc:
+                self.get_logger().warn(f'Could not remove {self.store_path}: {exc}')
+        # Publish an empty payload so subscribers immediately see "no faces".
+        self._persist_and_publish()
 
     def _persist_and_publish(self) -> None:
         payload = {

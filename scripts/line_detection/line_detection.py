@@ -15,7 +15,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.duration import Duration
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
+                        QoSDurabilityPolicy, QoSReliabilityPolicy,
+                        QoSHistoryPolicy)
 
 import tf2_ros
 import tf2_geometry_msgs  # registers PointStamped transform support
@@ -39,6 +41,40 @@ LINE_COLORS = {
     4: (0.0, 0.8, 0.0, 1.0),  # green
 }
 
+# Class IDs (mirror util.line_mask).
+CLS_YELLOW = 1
+CLS_RED    = 2
+CLS_BLUE   = 3
+CLS_GREEN  = 4
+
+# Yellow-line safety zone in base_link frame (X forward, Y left).
+# task2.py reverses on /lines/yellow_alert; the box has to be tight enough
+# that the robot doesn't keep tripping the alert *while* reversing, but
+# loose enough that we don't run wheels onto the line. At desired_linear_vel
+# = 0.5 m/s with ~0.2 s detect→cancel latency, ~0.1 m of travel happens
+# after the alert fires, so X_MAX ≥ 0.15 m is the practical floor.
+YELLOW_DANGER_X_MAX  = 0.35  # m forward (was 0.6)
+YELLOW_DANGER_HALF_Y = 0.25  # m to either side (was 0.4)
+YELLOW_DANGER_MIN_POINTS = 8
+
+# Blue-line follow geometry.
+BLUE_LOOKAHEAD    = 0.7      # m ahead along the PCA-fitted line
+BLUE_MIN_POINTS   = 15
+
+# A red / green cell line counts as "this is the cell entrance" only when
+# its centroid is within this radius of the robot. Stops a sliver of red
+# seen at 4 m from accidentally locking the cell pose to a noisy spot.
+CELL_PROXIMITY_R  = 1.5      # m, robot → cell centroid
+CELL_MIN_POINTS   = 30
+
+
+_LATCHED_QOS = QoSProfile(
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=1,
+)
+
 
 class LineDetector(Node):
 
@@ -53,6 +89,29 @@ class LineDetector(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.pc_pub = self.create_publisher(PointCloud2, '/line_detector/points', 10)
+
+        # Yellow-only cloud feeds the Nav2 costmap layer `line_obstacles` so
+        # the global planner routes around painted no-go lines (in addition
+        # to the reactive /lines/yellow_alert safety stop in task2).
+        self.yellow_obstacles_pub = self.create_publisher(
+            PointCloud2, '/lines/yellow_obstacles', 10)
+
+        # task2.py contract — every signal it subscribes to lives here.
+        self.yellow_alert_pub  = self.create_publisher(Bool,        '/lines/yellow_alert',  10)
+        self.blue_target_pub   = self.create_publisher(PoseStamped, '/lines/blue_target',   10)
+        # Red/green follow targets used by task2 anomaly inspection — same
+        # PCA-along-the-line logic as blue, but for the cell stripes in
+        # front of the conveyor belt. Robot drives along these to sweep.
+        self.red_target_pub    = self.create_publisher(PoseStamped, '/lines/red_target',    10)
+        self.green_target_pub  = self.create_publisher(PoseStamped, '/lines/green_target',  10)
+        self.cell_detected_pub = self.create_publisher(String,      '/lines/cell_detected', 10)
+        self.red_cell_pose_pub   = self.create_publisher(PoseStamped, '/lines/red_cell_pose',   _LATCHED_QOS)
+        self.green_cell_pose_pub = self.create_publisher(PoseStamped, '/lines/green_cell_pose', _LATCHED_QOS)
+
+        # Latch the first plausible cell pose we see; later frames only
+        # update it if the observation is closer (more reliable centroid).
+        self._red_cell_best:   tuple[float, np.ndarray] | None = None  # (range_m, map_xyz)
+        self._green_cell_best: tuple[float, np.ndarray] | None = None
 
         self.rgb_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/image_raw")
         self.depth_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/depth")
@@ -222,6 +281,8 @@ class LineDetector(Node):
 
         all_xyz = []
         all_rgb = []
+        per_class_body: dict[int, np.ndarray] = {}   # body (≈base_link) frame, (N,3)
+        per_class_world: dict[int, np.ndarray] = {}  # map frame, (N,3)
 
         for class_id in [c for c in np.unique(line_labels) if c > 0]:
             class_mask = ((line_labels == class_id) * 255).astype(np.uint8)
@@ -256,21 +317,185 @@ class LineDetector(Node):
             ros_y = -cam_x
             ros_z = -cam_y
 
+            body_xyz = np.stack([ros_x, ros_y, ros_z], axis=1).astype(np.float32)
+            per_class_body[int(class_id)] = body_xyz
+
             # Transform all points to map frame in one matrix multiply
             pts = np.stack([ros_x, ros_y, ros_z, np.ones_like(ros_x)], axis=1)  # (N,4)
             pts_world = (T @ pts.T).T  # (N,4)
+            per_class_world[int(class_id)] = pts_world[:, :3].astype(np.float32)
 
-            all_xyz.append(pts_world[:, :3].astype(np.float32))
+            all_xyz.append(per_class_world[int(class_id)])
 
-            b, g, r = colors_bgr.get(class_id, (255, 255, 255))
+            b, g, r = colors_bgr.get(int(class_id), (255, 255, 255))
             all_rgb.append(np.tile([r, g, b], (len(pts_world), 1)).astype(np.uint8))
 
-        if not all_xyz:
-            return
+        # 1. Combined pointcloud (RViz / Nav2 costmap source).
+        if all_xyz:
+            xyz = np.concatenate(all_xyz, axis=0)
+            rgb = np.concatenate(all_rgb, axis=0)
+            self.pc_pub.publish(self._make_pointcloud2(xyz, rgb, stamp))
 
-        xyz = np.concatenate(all_xyz, axis=0)
-        rgb = np.concatenate(all_rgb, axis=0)
-        self.pc_pub.publish(self._make_pointcloud2(xyz, rgb, stamp))
+        # 1b. Yellow-only cloud for the Nav2 costmap obstacle layer.
+        yellow_world = per_class_world.get(CLS_YELLOW)
+        if yellow_world is not None and yellow_world.shape[0] > 0:
+            yellow_rgb = np.tile([255, 200, 0], (len(yellow_world), 1)).astype(np.uint8)
+            self.yellow_obstacles_pub.publish(
+                self._make_pointcloud2(yellow_world, yellow_rgb, stamp))
+
+        # 2. Yellow safety alert — must publish *every* frame so task2 sees the
+        #    falling edge after the robot has reversed away from the line.
+        self._publish_yellow_alert(per_class_body.get(CLS_YELLOW))
+
+        # 3. Blue follow target (base_link frame so task2's pose math holds).
+        self._publish_blue_target(per_class_body.get(CLS_BLUE), stamp)
+
+        # 4. Red / green cell entrance poses (map frame, latched) +
+        #    /lines/cell_detected label for the closest live cell line.
+        self._publish_cell_signals(per_class_body, per_class_world, stamp)
+
+    # ── Per-signal helpers ──────────────────────────────────────────────────
+
+    def _publish_yellow_alert(self, body_pts: np.ndarray | None) -> None:
+        alert = False
+        if body_pts is not None and body_pts.shape[0] >= YELLOW_DANGER_MIN_POINTS:
+            x = body_pts[:, 0]
+            y = body_pts[:, 1]
+            in_box = ((x > 0.0) & (x < YELLOW_DANGER_X_MAX) &
+                      (np.abs(y) < YELLOW_DANGER_HALF_Y))
+            alert = bool(in_box.sum() >= YELLOW_DANGER_MIN_POINTS)
+        self.yellow_alert_pub.publish(Bool(data=alert))
+
+    def _publish_blue_target(self, body_pts: np.ndarray | None, stamp) -> None:
+        self._publish_line_target(body_pts, self.blue_target_pub, stamp,
+                                  lookahead=BLUE_LOOKAHEAD,
+                                  min_points=BLUE_MIN_POINTS)
+
+    def _publish_line_target(self, body_pts: np.ndarray | None, pub,
+                              stamp, lookahead: float, min_points: int,
+                              max_x: float = 3.0,
+                              max_abs_y: float = 1.5) -> None:
+        """Publish a base_link-frame lookahead pose along the fitted line.
+
+        Used by all three follow targets (blue, red, green). Robot reads
+        this and steers toward it — drives along the stripe.
+        """
+        if body_pts is None or body_pts.shape[0] < min_points:
+            return
+        # Keep only points in front of the robot inside a sensible window
+        # (any stripe across the room would corrupt the PCA fit).
+        x = body_pts[:, 0]
+        y = body_pts[:, 1]
+        near = (x > 0.0) & (x < max_x) & (np.abs(y) < max_abs_y)
+        if int(near.sum()) < min_points:
+            return
+        pts2 = body_pts[near, :2].astype(np.float64)
+
+        centroid = pts2.mean(axis=0)
+        cov = np.cov((pts2 - centroid).T)
+        try:
+            eigvals, eigvecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            return
+        direction = eigvecs[:, int(np.argmax(eigvals))]
+        # Direction should point forward of the robot (positive X).
+        if direction[0] < 0:
+            direction = -direction
+
+        # Project robot origin (0,0) onto the fitted line.
+        foot = centroid + ((np.zeros(2) - centroid) @ direction) * direction
+        target = foot + direction * lookahead
+
+        # Clamp to the furthest observed point so we don't overshoot the
+        # end of the visible line.
+        proj = (pts2 - centroid) @ direction
+        t_target = float((target - centroid) @ direction)
+        t_max = float(proj.max())
+        if t_target > t_max:
+            target = centroid + t_max * direction
+
+        msg = PoseStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'base_link'
+        msg.pose.position.x = float(target[0])
+        msg.pose.position.y = float(target[1])
+        msg.pose.position.z = 0.0
+        yaw = math.atan2(float(direction[1]), float(direction[0]))
+        msg.pose.orientation = Quaternion(
+            x=0.0, y=0.0,
+            z=math.sin(yaw / 2.0),
+            w=math.cos(yaw / 2.0),
+        )
+        pub.publish(msg)
+
+    def _publish_cell_signals(self, body_by_cls, world_by_cls, stamp) -> None:
+        # Best (closest in base_link) cell colour visible right now, used for
+        # /lines/cell_detected; latched cell-pose updates use this too.
+        best_label: str | None = None
+        best_range = float('inf')
+
+        def update_best(label: str, body_pts: np.ndarray) -> float:
+            nonlocal best_label, best_range
+            # robot-frame range to the cell centroid (planar)
+            cxy = body_pts[:, :2].mean(axis=0)
+            r = float(np.hypot(cxy[0], cxy[1]))
+            if r < best_range:
+                best_range = r
+                best_label = label
+            return r
+
+        # Red cell
+        red_body  = body_by_cls.get(CLS_RED)
+        red_world = world_by_cls.get(CLS_RED)
+        if red_body is not None and red_body.shape[0] >= CELL_MIN_POINTS:
+            r = update_best('red', red_body)
+            if r < CELL_PROXIMITY_R:
+                self._latch_cell_pose('red', red_world, r, stamp)
+            # Always publish a follow target so task2 can drive along the
+            # stripe once it's near the cell entrance.
+            self._publish_line_target(red_body, self.red_target_pub, stamp,
+                                       lookahead=0.5, min_points=CELL_MIN_POINTS,
+                                       max_x=2.5, max_abs_y=1.5)
+
+        # Green cell
+        green_body  = body_by_cls.get(CLS_GREEN)
+        green_world = world_by_cls.get(CLS_GREEN)
+        if green_body is not None and green_body.shape[0] >= CELL_MIN_POINTS:
+            r = update_best('green', green_body)
+            if r < CELL_PROXIMITY_R:
+                self._latch_cell_pose('green', green_world, r, stamp)
+            self._publish_line_target(green_body, self.green_target_pub, stamp,
+                                       lookahead=0.5, min_points=CELL_MIN_POINTS,
+                                       max_x=2.5, max_abs_y=1.5)
+
+        # Blue line counts as "in the blue room" for the cell label (used by
+        # detect_barrels to suppress detection there).
+        blue_body = body_by_cls.get(CLS_BLUE)
+        if blue_body is not None and blue_body.shape[0] >= BLUE_MIN_POINTS:
+            update_best('blue', blue_body)
+
+        if best_label is not None:
+            self.cell_detected_pub.publish(String(data=best_label))
+
+    def _latch_cell_pose(self, colour: str, world_pts: np.ndarray,
+                          range_m: float, stamp) -> None:
+        """Publish (and remember) the closer of competing red/green observations."""
+        attr = f'_{colour}_cell_best'
+        prev = getattr(self, attr)
+        if prev is not None and prev[0] <= range_m:
+            return
+        centroid_map = world_pts.mean(axis=0)
+        setattr(self, attr, (range_m, centroid_map))
+
+        msg = PoseStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'map'
+        msg.pose.position.x = float(centroid_map[0])
+        msg.pose.position.y = float(centroid_map[1])
+        msg.pose.position.z = 0.0
+        msg.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        pub = self.red_cell_pose_pub if colour == 'red' else self.green_cell_pose_pub
+        pub.publish(msg)
 
 
     def _transform_to_matrix(self, t, q):
