@@ -54,13 +54,14 @@ from barrel_map import BarrelMap, BarrelLandmark  # noqa: E402
 # Each entry is a list of (H_lo, S_lo, V_lo, H_hi, S_hi, V_hi) ranges that
 # get OR-ed together.  Red wraps the hue circle so it has two ranges.
 COLOUR_RANGES: dict[str, list[tuple[int, int, int, int, int, int]]] = {
-    'red':    [(0, 110, 80, 10, 255, 255), (170, 110, 80, 180, 255, 255)],
+    'red':    [(0, 120, 80, 10, 255, 255), (170, 120, 80, 180, 255, 255)],
     'orange': [(11, 130, 110, 22, 255, 255)],
-    'yellow': [(23, 110, 120, 35, 255, 255)],
-    'green':  [(40, 70, 50, 85, 255, 255)],
-    'blue':   [(95, 80, 50, 130, 255, 255)],
-    'purple': [(131, 60, 50, 160, 255, 255)],
-    'brown':  [(0, 60, 30, 22, 200, 110)],
+    'yellow': [(23, 120, 120, 35, 255, 255)],
+    'green':  [(40, 100, 50, 85, 255, 255)],
+    'blue':   [(95, 120, 50, 130, 255, 255)],
+    'purple': [(131, 100, 50, 160, 255, 255)],
+    'brown':  [(0, 80, 30, 22, 200, 110)],
+    'black':  [(0, 0, 0, 180, 255, 80)],
 }
 
 # RGB used for the RViz CYLINDER marker colour swatch.
@@ -72,19 +73,20 @@ COLOUR_RGB: dict[str, tuple[float, float, float]] = {
     'blue':   (0.0, 0.3, 1.0),
     'purple': (0.6, 0.0, 0.8),
     'brown':  (0.45, 0.27, 0.07),
+    'black':  (0.15, 0.15, 0.15),
     'unknown': (0.5, 0.5, 0.5),
 }
 
 # Physical sanity bounds (standard 200 L barrel ≈ 0.57 m d × 0.88 m h).
-BARREL_RADIUS_RANGE = (0.18, 0.42)   # m
-BARREL_LENGTH_RANGE = (0.4, 1.2)     # m
+BARREL_RADIUS_RANGE = (0.10, 0.45)   # m
+BARREL_LENGTH_RANGE = (0.25, 1.25)     # m
 
 # PCA classification thresholds.  A real barrel surface seen from one side
 # gives λ0/λ1 ≈ 3–4 (length variance / circle-half variance).  The cosine-Z
 # check below is what actually distinguishes vertical from horizontal —
 # the ratio gate is just there to reject non-elongated colour blobs.
-PCA_AXIS_RATIO_VERT = 3.0
-PCA_AXIS_RATIO_HORIZ = 3.0
+PCA_AXIS_RATIO_VERT = 1.0
+PCA_AXIS_RATIO_HORIZ = 1.0
 VERTICAL_COS_MIN = 0.85          # dot(v0, world_z)
 HORIZONTAL_COS_MAX = 0.30
 
@@ -187,6 +189,8 @@ def axis_to_quat(axis: np.ndarray) -> Quaternion:
 # ---------------------------------------------------------------------------
 
 class BarrelDetector(Node):
+    DETECTION_EVERY_N_FRAMES = 3   # run detection only every Nth frame to save CPU
+
     def __init__(self) -> None:
         super().__init__('detect_barrels')
 
@@ -200,6 +204,8 @@ class BarrelDetector(Node):
         # Per-camera state.
         self._intrinsics: dict[str, dict] = {}      # key -> {fx, fy, cx, cy}
         self._cam_cfg: dict[str, CameraCfg] = {c.key: c for c in CAMERAS}
+        self._frame_counts = {'oakd': 0, 'top': 0}
+        self._last_vis = {'oakd': None, 'top': None}
 
         # Publishers
         self.markers_pub = self.create_publisher(MarkerArray, '/barrel_markers', _QOS_LATCHED)
@@ -253,6 +259,16 @@ class BarrelDetector(Node):
     def _stream_cb(self, rgb_msg: Image, depth_msg: Image, cam_key: str) -> None:
         if cam_key not in self._intrinsics:
             return
+
+        self._frame_counts[cam_key] += 1
+        if self._frame_counts[cam_key] % self.DETECTION_EVERY_N_FRAMES != 0:
+            last = self._last_vis.get(cam_key)
+            if last is not None:
+                wname = 'barrels_oakd' if cam_key == 'oakd' else 'barrels_top'
+                cv2.imshow(wname, last)
+                cv2.waitKey(1)
+            return
+
         try:
             rgb = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
             depth = self.bridge.imgmsg_to_cv2(depth_msg, '32FC1')
@@ -282,7 +298,7 @@ class BarrelDetector(Node):
         hsv = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV)
 
         # Per-colour masks, processed in priority order to suppress brown/red overlap.
-        priority = ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'brown']
+        priority = ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'brown', 'black']
         consumed = np.zeros((h, w), dtype=bool)
         candidates: list[dict] = []
 
@@ -328,7 +344,7 @@ class BarrelDetector(Node):
             if res is not None:
                 results.append(res)
 
-        self._show_debug(cam_key, rgb, candidates)
+        self._show_debug(cam_key, rgb, results)
 
         # Spill search for any horizontal barrel observed this frame.
         for res in results:
@@ -338,7 +354,7 @@ class BarrelDetector(Node):
                 continue
             lm = res['landmark']
             spill_map = self._detect_spill(rgb, depth, frame_id, cam_key, cfg,
-                                           res['bbox'], lm.ground_anchor)
+                                           res['bbox'], lm.ground_anchor, res['colour'])
             if spill_map is not None:
                 self.barrel_map.register_spill(lm, spill_map, cam_key)
 
@@ -375,6 +391,22 @@ class BarrelDetector(Node):
         if pts_map is None:
             return None
 
+        # Filter out points that are flat on the floor (potential spill points)
+        # to prevent them from distorting the barrel shape during PCA/dimensions check.
+        above_floor = pts_map[:, 2] > 0.08
+        if above_floor.sum() < MIN_BLOB_POINTS:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Too few points ({above_floor.sum()}) above floor level (>0.08m)")
+            return None
+        # Ground anchor (lowest point of the barrel above the floor)
+        ground_anchor = pts_map[np.argmin(pts_map[:, 2])]
+
+        # Filter out distant background structures (like tunnel walls) by keeping only points within 1.1m of the ground anchor
+        dist_to_anchor = np.linalg.norm(pts_map - ground_anchor, axis=1)
+        pts_map = pts_map[dist_to_anchor < 1.1]
+        if pts_map.shape[0] < MIN_BLOB_POINTS:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Too few points ({pts_map.shape[0]}) within 1.1m of ground anchor")
+            return None
+
         # PCA on map-frame point cloud (orientation reasoned in world frame).
         centroid = pts_map.mean(axis=0)
         cov = np.cov((pts_map - centroid).T)
@@ -391,37 +423,79 @@ class BarrelDetector(Node):
         cos_z = abs(float(np.dot(v0, np.array([0.0, 0.0, 1.0]))))
         ratio = lam0 / lam1
 
-        orientation: Optional[str]
+        # Calculate Z-extent
+        z_extent = float(pts_map[:, 2].max() - pts_map[:, 2].min())
+
+        # Ground anchor
+        ground_anchor = pts_map[np.argmin(pts_map[:, 2])]
+
+        # Length: extent along v0
+        proj = (pts_map - centroid) @ v0
+        length = float(proj.max() - proj.min())
+
+        # Radius: extent perpendicular to v0
+        perp = pts_map - centroid - np.outer(proj, v0)
+        radii = np.linalg.norm(perp, axis=1)
+        radius_est = float(np.percentile(radii, 90))
+
+        # Orientation candidate
+        orientation: Optional[str] = None
         if cos_z > VERTICAL_COS_MIN and ratio > PCA_AXIS_RATIO_VERT:
             orientation = 'vertical'
         elif cos_z < HORIZONTAL_COS_MAX and ratio > PCA_AXIS_RATIO_HORIZ:
             orientation = 'horizontal'
-        else:
-            return None  # ambiguous — drop the frame
 
-        # Geometric sanity check on size.
-        # Length: extent along v0.
-        proj = (pts_map - centroid) @ v0
-        length = float(proj.max() - proj.min())
-        # Radius: extent perpendicular to v0 (use eigvec1/eigvec2 plane).
-        perp = pts_map - centroid - np.outer(proj, v0)
-        radii = np.linalg.norm(perp, axis=1)
-        radius_est = float(np.percentile(radii, 90))
+        # Log measured stats for the candidate
+        self.get_logger().info(
+            f"[MEASUREMENT] Color: {cand['colour']}, Centroid: [{centroid[0]:.2f}, {centroid[1]:.2f}, {centroid[2]:.2f}], "
+            f"Ratio: {ratio:.2f}, Cos_Z: {cos_z:.2f}, Length: {length:.2f}, Radius: {radius_est:.2f}, "
+            f"Z-extent: {z_extent:.2f}, Ground_Z: {ground_anchor[2]:.2f}"
+        )
+
+        # Reject extremely elongated objects like floor lines
+        if ratio > 6.5:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Ratio {ratio:.2f} > 6.5 (too elongated)")
+            return None
+
+        if orientation is None:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Ambiguous orientation (cos_z={cos_z:.2f}, ratio={ratio:.2f})")
+            return None
+
+        # Height / Z-extent sanity check (barrel length ≈ 0.88m, diameter ≈ 0.56m)
+        if orientation == 'vertical' and not (0.25 <= z_extent <= 1.15):
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Vertical Z-extent {z_extent:.2f} out of [0.25, 1.15]")
+            return None
+        if orientation == 'horizontal' and not (0.20 <= z_extent <= 0.75):
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Horizontal Z-extent {z_extent:.2f} out of [0.20, 0.75]")
+            return None
+
+        # Ensure the barrel is resting on the floor (reject high ring stand and conveyor)
+        if not (-0.15 <= ground_anchor[2] <= 0.12):
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Ground anchor Z {ground_anchor[2]:.2f} out of [-0.15, 0.12]")
+            return None
+
+        # Restrict to first room only (X < 4.5)
+        if centroid[0] > 4.5:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Centroid X {centroid[0]:.2f} > 4.5 (not first room)")
+            return None
+
+        # Size check
         if not (BARREL_LENGTH_RANGE[0] <= length <= BARREL_LENGTH_RANGE[1]):
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Length {length:.2f} out of range {BARREL_LENGTH_RANGE}")
             return None
         if not (BARREL_RADIUS_RANGE[0] <= radius_est <= BARREL_RADIUS_RANGE[1]):
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Radius {radius_est:.2f} out of range {BARREL_RADIUS_RANGE}")
             return None
 
-        # Ground anchor: lowest-Z point (for spill search & RViz).
-        ground_anchor = pts_map[np.argmin(pts_map[:, 2])]
+        self.get_logger().info(f"-> ACCEPTED {cand['colour']} barrel!")
 
         # Discovery vs update.
         if not cfg.discovery:
-            nearest = self.barrel_map.nearest_landmark(centroid, max_dist=1.0)
+            nearest = self.barrel_map.nearest_landmark(centroid, cand['colour'], max_dist=1.0)
             if nearest is None:
                 return None
 
-        lm = self.barrel_map.update(centroid, cand['colour'], orientation, ground_anchor)
+        lm = self.barrel_map.update(centroid, cand['colour'], orientation, ground_anchor, camera_id=cam_key)
         if lm is None:
             return None
 
@@ -438,7 +512,8 @@ class BarrelDetector(Node):
     def _detect_spill(self, rgb: np.ndarray, depth: np.ndarray,
                       frame_id: str, cam_key: str, cfg: CameraCfg,
                       bbox: tuple[int, int, int, int],
-                      barrel_anchor: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                      barrel_anchor: Optional[np.ndarray],
+                      barrel_colour: str) -> Optional[np.ndarray]:
         """Look for a saturated coloured patch on the floor near the barrel.
 
         Returns the map-frame centroid of the spill, or None.
@@ -458,10 +533,17 @@ class BarrelDetector(Node):
         roi_rgb = rgb[y0:y1, x0:x1]
         roi_depth = depth[y0:y1, x0:x1]
         roi_hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_BGR2HSV)
-        # Any saturated coloured patch (spill colour ≠ barrel colour in general).
-        sat_mask = cv2.inRange(roi_hsv,
-                               np.array([0, 70, 50]),
-                               np.array([180, 255, 255]))
+        
+        # Look ONLY for spills that match the barrel's colour to avoid mistaking floor lines
+        sat_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        for h_lo, s_lo, v_lo, h_hi, s_hi, v_hi in COLOUR_RANGES[barrel_colour]:
+            if barrel_colour == 'black':
+                # Black spills are extremely dark patches on the floor
+                sat_mask |= cv2.inRange(roi_hsv, np.array([0, 0, 0]), np.array([180, 255, 50]))
+            else:
+                # For colored spills, we match the parent color but allow slightly lower saturation/value
+                sat_mask |= cv2.inRange(roi_hsv, np.array([h_lo, 60, 40]), np.array([h_hi, 255, 255]))
+
         # Exclude depth pixels that are too far / NaN.
         finite = np.isfinite(roi_depth) & (roi_depth > cfg.depth_min) & (roi_depth < cfg.depth_max)
         sat_mask[~finite] = 0
@@ -539,15 +621,34 @@ class BarrelDetector(Node):
     # ----------------------------------------------------------------- output
 
     def _show_debug(self, cam_key: str, rgb: np.ndarray, candidates: list) -> None:
-        vis = rgb.copy()
+        if not hasattr(self, '_vis_history'):
+            self._vis_history = {'oakd': {}, 'top': {}}
+
+        # Decrement decay counter for existing items
+        history = self._vis_history[cam_key]
+        for colour in list(history.keys()):
+            bbox, frames_left = history[colour]
+            if frames_left <= 1:
+                del history[colour]
+            else:
+                history[colour] = (bbox, frames_left - 1)
+
+        # Update history with current frame's detections
         for cand in candidates:
-            x, y, w_, h_ = cand['bbox']
-            r, g, b = COLOUR_RGB.get(cand['colour'], (0.8, 0.8, 0.8))
+            history[cand['colour']] = (cand['bbox'], 8)  # persist for 8 frames
+
+        # Draw all active visual detections in history
+        vis = rgb.copy()
+        for colour, (bbox, _) in history.items():
+            x, y, w_, h_ = bbox
+            r, g, b = COLOUR_RGB.get(colour, (0.8, 0.8, 0.8))
             colour_bgr = (int(b * 255), int(g * 255), int(r * 255))
             cv2.rectangle(vis, (x, y), (x + w_, y + h_), colour_bgr, 2)
-            cv2.putText(vis, cand['colour'], (x, max(15, y - 5)),
+            cv2.putText(vis, colour, (x, max(15, y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour_bgr, 1)
+
         wname = 'barrels_oakd' if cam_key == 'oakd' else 'barrels_top'
+        self._last_vis[cam_key] = vis
         cv2.imshow(wname, vis)
 
     def _publish(self) -> None:
