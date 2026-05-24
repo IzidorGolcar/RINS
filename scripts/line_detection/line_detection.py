@@ -238,6 +238,13 @@ class LineDetector(Node):
 
             # Thin to 1-px skeleton — drastically reduces point count
             thin = self._skeletonize(class_mask)
+            # Remove skeleton pixels near image borders to avoid spurious T-ends
+            margin = 4
+            if thin.shape[0] > 2 * margin and thin.shape[1] > 2 * margin:
+                thin[:margin, :] = 0
+                thin[-margin:, :] = 0
+                thin[:, :margin] = 0
+                thin[:, -margin:] = 0
 
             ys, xs = np.where(thin > 0)
             if len(xs) == 0:
@@ -251,6 +258,22 @@ class LineDetector(Node):
             ds_v = depths[valid]
             if len(ds_v) == 0:
                 continue
+
+            # Depth-consistency check: compare to local median depth
+            try:
+                depth_med = cv2.medianBlur(depth_image.astype(np.float32), 5)
+                med_vals = depth_med[ys_v, xs_v]
+                # allow either an absolute tolerance (5cm) or 5% relative
+                tol = np.maximum(0.05, 0.05 * ds_v)
+                consistency = np.abs(ds_v - med_vals) <= tol
+                if consistency.sum() == 0:
+                    continue
+                xs_v = xs_v[consistency]
+                ys_v = ys_v[consistency]
+                ds_v = ds_v[consistency]
+            except Exception:
+                # If median blur fails for any reason, fall back to original set
+                pass
 
             # Backproject to camera (optical) frame: Z forward, X right, Y down
             cam_x = (xs_v - self.cx_principal) * ds_v / self.fx
