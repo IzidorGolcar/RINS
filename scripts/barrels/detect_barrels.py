@@ -61,7 +61,7 @@ COLOUR_RANGES: dict[str, list[tuple[int, int, int, int, int, int]]] = {
     'blue':   [(95, 120, 50, 130, 255, 255)],
     'purple': [(131, 100, 50, 160, 255, 255)],
     'brown':  [(0, 80, 30, 22, 200, 110)],
-    'black':  [(0, 0, 0, 180, 255, 50)],
+    'black':  [(0, 0, 0, 180, 255, 80)],
 }
 
 # RGB used for the RViz CYLINDER marker colour swatch.
@@ -189,6 +189,8 @@ def axis_to_quat(axis: np.ndarray) -> Quaternion:
 # ---------------------------------------------------------------------------
 
 class BarrelDetector(Node):
+    DETECTION_EVERY_N_FRAMES = 3   # run detection only every Nth frame to save CPU
+
     def __init__(self) -> None:
         super().__init__('detect_barrels')
 
@@ -202,6 +204,8 @@ class BarrelDetector(Node):
         # Per-camera state.
         self._intrinsics: dict[str, dict] = {}      # key -> {fx, fy, cx, cy}
         self._cam_cfg: dict[str, CameraCfg] = {c.key: c for c in CAMERAS}
+        self._frame_counts = {'oakd': 0, 'top': 0}
+        self._last_vis = {'oakd': None, 'top': None}
 
         # Publishers
         self.markers_pub = self.create_publisher(MarkerArray, '/barrel_markers', _QOS_LATCHED)
@@ -255,6 +259,16 @@ class BarrelDetector(Node):
     def _stream_cb(self, rgb_msg: Image, depth_msg: Image, cam_key: str) -> None:
         if cam_key not in self._intrinsics:
             return
+
+        self._frame_counts[cam_key] += 1
+        if self._frame_counts[cam_key] % self.DETECTION_EVERY_N_FRAMES != 0:
+            last = self._last_vis.get(cam_key)
+            if last is not None:
+                wname = 'barrels_oakd' if cam_key == 'oakd' else 'barrels_top'
+                cv2.imshow(wname, last)
+                cv2.waitKey(1)
+            return
+
         try:
             rgb = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
             depth = self.bridge.imgmsg_to_cv2(depth_msg, '32FC1')
@@ -340,7 +354,7 @@ class BarrelDetector(Node):
                 continue
             lm = res['landmark']
             spill_map = self._detect_spill(rgb, depth, frame_id, cam_key, cfg,
-                                           res['bbox'], lm.ground_anchor)
+                                           res['bbox'], lm.ground_anchor, res['colour'])
             if spill_map is not None:
                 self.barrel_map.register_spill(lm, spill_map, cam_key)
 
@@ -375,6 +389,22 @@ class BarrelDetector(Node):
         # Transform to map frame.
         pts_map = self._transform_points(pts_body, frame_id)
         if pts_map is None:
+            return None
+
+        # Filter out points that are flat on the floor (potential spill points)
+        # to prevent them from distorting the barrel shape during PCA/dimensions check.
+        above_floor = pts_map[:, 2] > 0.08
+        if above_floor.sum() < MIN_BLOB_POINTS:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Too few points ({above_floor.sum()}) above floor level (>0.08m)")
+            return None
+        # Ground anchor (lowest point of the barrel above the floor)
+        ground_anchor = pts_map[np.argmin(pts_map[:, 2])]
+
+        # Filter out distant background structures (like tunnel walls) by keeping only points within 1.1m of the ground anchor
+        dist_to_anchor = np.linalg.norm(pts_map - ground_anchor, axis=1)
+        pts_map = pts_map[dist_to_anchor < 1.1]
+        if pts_map.shape[0] < MIN_BLOB_POINTS:
+            self.get_logger().info(f"-> Rejected {cand['colour']}: Too few points ({pts_map.shape[0]}) within 1.1m of ground anchor")
             return None
 
         # PCA on map-frame point cloud (orientation reasoned in world frame).
@@ -482,7 +512,8 @@ class BarrelDetector(Node):
     def _detect_spill(self, rgb: np.ndarray, depth: np.ndarray,
                       frame_id: str, cam_key: str, cfg: CameraCfg,
                       bbox: tuple[int, int, int, int],
-                      barrel_anchor: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                      barrel_anchor: Optional[np.ndarray],
+                      barrel_colour: str) -> Optional[np.ndarray]:
         """Look for a saturated coloured patch on the floor near the barrel.
 
         Returns the map-frame centroid of the spill, or None.
@@ -502,14 +533,16 @@ class BarrelDetector(Node):
         roi_rgb = rgb[y0:y1, x0:x1]
         roi_depth = depth[y0:y1, x0:x1]
         roi_hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_BGR2HSV)
-        # Any saturated coloured patch or a dark black patch (black spill).
-        sat_mask_col = cv2.inRange(roi_hsv,
-                                   np.array([0, 70, 50]),
-                                   np.array([180, 255, 255]))
-        sat_mask_black = cv2.inRange(roi_hsv,
-                                     np.array([0, 0, 0]),
-                                     np.array([180, 255, 45]))
-        sat_mask = sat_mask_col | sat_mask_black
+        
+        # Look ONLY for spills that match the barrel's colour to avoid mistaking floor lines
+        sat_mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        for h_lo, s_lo, v_lo, h_hi, s_hi, v_hi in COLOUR_RANGES[barrel_colour]:
+            if barrel_colour == 'black':
+                # Black spills are extremely dark patches on the floor
+                sat_mask |= cv2.inRange(roi_hsv, np.array([0, 0, 0]), np.array([180, 255, 50]))
+            else:
+                # For colored spills, we match the parent color but allow slightly lower saturation/value
+                sat_mask |= cv2.inRange(roi_hsv, np.array([h_lo, 60, 40]), np.array([h_hi, 255, 255]))
 
         # Exclude depth pixels that are too far / NaN.
         finite = np.isfinite(roi_depth) & (roi_depth > cfg.depth_min) & (roi_depth < cfg.depth_max)
@@ -615,6 +648,7 @@ class BarrelDetector(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour_bgr, 1)
 
         wname = 'barrels_oakd' if cam_key == 'oakd' else 'barrels_top'
+        self._last_vis[cam_key] = vis
         cv2.imshow(wname, vis)
 
     def _publish(self) -> None:
