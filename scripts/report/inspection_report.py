@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+# Anomaly tile screenshots are dumped here by anomaly_detector.py
+# (filename pattern: `tile_<id>.png` and `tile_<id>_anomaly.png`).
+ANOMALY_TILE_IMG_DIR = '/tmp/anomaly_tiles'
+
 
 @dataclass
 class BarrelEntry:
@@ -65,8 +69,10 @@ class InspectionReport:
             from reportlab.lib import colors
             from reportlab.lib.pagesizes import A4
             from reportlab.lib.styles import getSampleStyleSheet
-            from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer,
-                                            Table, TableStyle)
+            from reportlab.lib.units import inch
+            from reportlab.platypus import (Image as RLImage,
+                                            Paragraph, SimpleDocTemplate,
+                                            Spacer, Table, TableStyle)
         except ImportError:
             md_path = out_dir_path / f'inspection_report_{stamp}.md'
             md_path.write_text(self._as_markdown(), encoding='utf-8')
@@ -107,10 +113,51 @@ class InspectionReport:
                 story.append(Spacer(1, 6))
                 for line in totals:
                     story.append(Paragraph(line, styles['Normal']))
+
+            # For anomaly tasks, embed the per-tile screenshots saved
+            # by anomaly_detector.py (raw + overlay side-by-side).
+            if ex.task_type.startswith('anomaly') and isinstance(ex.results, list):
+                img_rows = self._anomaly_tile_image_rows(ex.results, RLImage, inch)
+                if img_rows:
+                    story.append(Spacer(1, 8))
+                    story.append(Paragraph('<b>Tile screenshots</b>',
+                                            styles['Heading3']))
+                    img_tbl = Table(img_rows, hAlign='LEFT')
+                    img_tbl.setStyle(TableStyle([
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('BOX',    (0, 0), (-1, -1), 0.25, colors.grey),
+                        ('INNERGRID', (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                    ]))
+                    story.append(img_tbl)
+                else:
+                    story.append(Paragraph(
+                        '<i>(no tile screenshots found in '
+                        f'{ANOMALY_TILE_IMG_DIR})</i>',
+                        styles['Italic']))
+
             story.append(Spacer(1, 16))
 
         doc.build(story)
         return pdf_path
+
+    @staticmethod
+    def _anomaly_tile_image_rows(tile_results, RLImage, inch):
+        """Build a table of (id, raw, overlay) rows for every tile that
+        has on-disk screenshots in ANOMALY_TILE_IMG_DIR."""
+        rows = [['ID', 'Tile', 'Anomaly overlay']]
+        any_found = False
+        for t in tile_results:
+            raw = os.path.join(ANOMALY_TILE_IMG_DIR, f'tile_{t.id}.png')
+            ovl = os.path.join(ANOMALY_TILE_IMG_DIR, f'tile_{t.id}_anomaly.png')
+            raw_cell = (RLImage(raw, width=1.6 * inch, height=1.6 * inch)
+                        if os.path.exists(raw) else '—')
+            ovl_cell = (RLImage(ovl, width=1.6 * inch, height=1.6 * inch)
+                        if os.path.exists(ovl) else '—')
+            if os.path.exists(raw) or os.path.exists(ovl):
+                any_found = True
+            label = f'{t.id} ({"NOK" if t.anomalous else "OK"})'
+            rows.append([label, raw_cell, ovl_cell])
+        return rows if any_found else []
 
     # ----- helpers ----------------------------------------------------
 

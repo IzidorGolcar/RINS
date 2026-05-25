@@ -1140,9 +1140,14 @@ class Task2Node(RobotCommander):
         proceed with what they've got.
         """
         if len(item_dict) >= expected_count:
+            self.info(f'Already have {len(item_dict)}/{expected_count} '
+                      f'{item_label} from earlier exploration — '
+                      'no top-up search needed.')
             return
         self.info(f'Searching for {item_label} — found '
-                  f'{len(item_dict)}/{expected_count}, exploring more.')
+                  f'{len(item_dict)}/{expected_count} so far '
+                  '(including any seen during earlier exploration), '
+                  'exploring more.')
         while (len(item_dict) < expected_count
                 and self.waypoint_idx < len(self.coverage_waypoints)
                 and rclpy.ok()):

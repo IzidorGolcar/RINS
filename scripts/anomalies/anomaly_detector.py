@@ -74,6 +74,21 @@ class AnomalyDetector(Node):
 
         self.tile_marker_pub = self.create_publisher(MarkerArray, '/tile_markers', 10)
 
+        # Per-tile screenshots go here so the inspection-report PDF can
+        # embed them. Wiped on every node start so the previous run's
+        # tiles don't leak into this run's report.
+        self.tile_img_dir = '/tmp/anomaly_tiles'
+        os.makedirs(self.tile_img_dir, exist_ok=True)
+        for fname in os.listdir(self.tile_img_dir):
+            fp = os.path.join(self.tile_img_dir, fname)
+            if os.path.isfile(fp):
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+        self.get_logger().info(
+            f'Tile screenshots will be saved under {self.tile_img_dir}/')
+
         cv2.namedWindow('Tile Detections', cv2.WINDOW_NORMAL)
         cv2.namedWindow('Tiles', cv2.WINDOW_NORMAL)
 
@@ -264,6 +279,35 @@ class AnomalyDetector(Node):
         if marker_array.markers:
             self.tile_marker_pub.publish(marker_array)
 
+    def _save_tile_screenshots(self, idx: int, tile) -> None:
+        """Save the rectified tile and its anomaly overlay to disk so
+        inspection_report can embed both in the PDF. Filenames carry
+        the marker id so the report can look them up by tile id.
+        """
+        try:
+            raw_path = os.path.join(self.tile_img_dir, f'tile_{idx}.png')
+            cv2.imwrite(raw_path, tile.img)
+            # Build an anomaly overlay: red where the segmentation mask
+            # is positive, plus a green/red status banner.
+            overlay = tile.img.copy()
+            mask = tile.anomaly
+            if mask is not None and mask.any():
+                if mask.dtype == bool:
+                    overlay[mask] = [0, 0, 255]
+                else:
+                    overlay[mask > 0] = [0, 0, 255]
+            label = 'Anomaly Detected' if tile.is_anomalous else 'No Anomaly'
+            label_colour = (0, 0, 255) if tile.is_anomalous else (0, 200, 0)
+            cv2.putText(overlay, label, (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, label_colour, 2)
+            overlay_path = os.path.join(
+                self.tile_img_dir, f'tile_{idx}_anomaly.png')
+            cv2.imwrite(overlay_path, overlay)
+            self.get_logger().info(
+                f'Saved tile {idx} screenshots: {raw_path}, {overlay_path}')
+        except Exception as e:
+            self.get_logger().warn(f'Failed to save tile {idx} images: {e}')
+
     def detect_anomalies(self, cv_image):
         mask, quad = generate_tile_mask(cv_image)
         
@@ -285,6 +329,12 @@ class AnomalyDetector(Node):
                 prediction = self.segmentation_model.predict(tile_img)
                 tile = Tile(hash=tile_hash, img=tile_img, anomaly=prediction)
                 self.tiles.append(tile)
+                # Save tile screenshots for the inspection report. Index
+                # in the filename matches the marker `id` in
+                # /tile_markers and the `TileEntry.id` in task2 →
+                # inspection_report can embed by ID.
+                idx = len(self.tiles) - 1
+                self._save_tile_screenshots(idx, tile)
             else:
                 tile = next(t for t in self.tiles if tiles_are_same(tile_hash, t.hash))
 
