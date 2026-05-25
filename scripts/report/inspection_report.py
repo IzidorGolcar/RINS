@@ -1,13 +1,3 @@
-"""Inspection report aggregator + writer for Task 2.
-
-Plain Python, no ROS dependency. Imported from ``task2.py`` to collect
-per-sub-task results during the run and emit a final PDF (via
-``reportlab``) or Markdown (fallback if reportlab is not installed).
-
-Report layout follows the spec p.14 sample: date, robot name, then
-one section per requested task with results table.
-"""
-
 from __future__ import annotations
 
 import os

@@ -1,16 +1,3 @@
-#!/usr/bin/python3
-"""Barrel detector for Task 2 (Industry 5.0).
-
-Locates barrels, recognises colour, classifies orientation (vertical /
-horizontal), and detects spills under horizontal barrels.  Fuses an
-OAK-D forward stream with a top_camera downward stream into a single
-shared landmark map; spills must be seen by both cameras (or several
-times by one) before they latch as confirmed.
-
-See the design plan for rationale; key reuse from ``detect_rings.py``
-and ``ring_map.py``.
-"""
-
 from __future__ import annotations
 
 import json

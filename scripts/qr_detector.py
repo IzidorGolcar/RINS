@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""Standalone QR detector.
-
-Subscribes to the forward OAK-D RGB+depth, runs `pyzbar` on every frame,
-publishes each unique QR text on /qr/decoded (JSON), and drops a RViz
-TEXT_VIEW_FACING marker at the QR's 3D position in the map frame.
-
-This is independent of dialogue_node — it runs all the time so you can see
-QRs without triggering the dialogue fallback path.
-"""
-
 from __future__ import annotations
 
 import json

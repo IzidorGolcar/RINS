@@ -1,12 +1,3 @@
-"""Regex-based intent matcher for the constrained dialogue in Task 2.
-
-The vocabulary is tiny (spec p.9–10):
-    barrels | rings | anomaly_red | anomaly_green | nothing
-plus confirm / reconsider signals for the woman re-ask flow.
-
-Pure Python, no ML. Importable and unit-testable without ROS.
-"""
-
 from __future__ import annotations
 
 import re

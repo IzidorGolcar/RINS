@@ -1,10 +1,3 @@
-"""Barrel landmark tracker.
-
-Close port of ``rings/ring_map.py`` with barrel-specific state:
-colour history, orientation history, leak (sticky) and spill anchor.
-Confirmation thresholds are retuned for the barrel use case (see plan).
-"""
-
 from __future__ import annotations
 
 from collections import Counter
