@@ -3,88 +3,59 @@
 import numpy as np
 import cv2
 
-
+# Recalibrated HSV ranges
 DEFAULT_HSV = {
     #         (H_low, S_low, V_low)   (H_high, S_high, V_high)
     "yellow": ((20,  100, 100),       (35,  255, 255)),
     "green":  ((40,   80,  80),       (80,  255, 255)),
-    "blue":   ((90,   20,  20),       (135, 255, 255)),
-    "red":    (( 0,  100, 100),       (179, 255, 255)),
+    
+    # Blue: Lowered S_low to 50 to catch the light blue, 
+    # but kept it above 30 to avoid gray floor noise.
+    "blue":   ((95,   50,  100),      (130, 255, 255)), 
+    
+    # Red: Kept saturation high to avoid picking up brown/gray tones
+    "red":    ((0,    120, 100),      (10,  255, 255)),
 }
 
 def line_mask(depth_image, rgb_image, ground_mask):
-    """Segment colored lines (yellow, red, green, blue) on the ground plane.
-    Returns multiclass labels: 0=background, 1=yellow, 2=red, 3=blue, 4=green.
-    """
     if ground_mask is None:
         return None
     
     h, w = rgb_image.shape[:2]
-    
-    # Initialize multiclass label map (0 = background)
     line_labels = np.zeros((h, w), dtype=np.uint8)
-    
-    # Convert RGB to HSV for color-based segmentation
     hsv_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2HSV)
-    
-    # Restrict to ground region
     ground_binary = (ground_mask > 0).astype(np.uint8)
     
-    # Create multiclass labels for each color
     color_class_map = {'yellow': 1, 'red': 2, 'blue': 3, 'green': 4}
-    class_colors = {
-        1: (255, 255, 0),
-        2: (0, 0, 255),
-        3: (255, 0, 0),
-        4: (0, 255, 0),
-    }
     
     for color_name, class_id in color_class_map.items():
-        if color_name not in DEFAULT_HSV:
-            continue
+        hsv_lo, hsv_hi = DEFAULT_HSV[color_name]
         
-        color_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        # Special handling for red which wraps around hue
         if color_name == 'red':
-            # Red in HSV wraps: 0-10 and 170-179
-            red_lo = cv2.inRange(hsv_image, np.array((0, 100, 100)), np.array((10, 255, 255)))
-            red_hi = cv2.inRange(hsv_image, np.array((170, 100, 100)), np.array((179, 255, 255)))
-            color_mask = cv2.bitwise_or(red_lo, red_hi)
+            # Standard red wrap-around for HSV
+            lower1, upper1 = np.array([0, 120, 100]), np.array([10, 255, 255])
+            lower2, upper2 = np.array([170, 120, 100]), np.array([180, 255, 255])
+            mask1 = cv2.inRange(hsv_image, lower1, upper1)
+            mask2 = cv2.inRange(hsv_image, lower2, upper2)
+            color_mask = cv2.bitwise_or(mask1, mask2)
         else:
-            hsv_lo, hsv_hi = DEFAULT_HSV[color_name]
             color_mask = cv2.inRange(hsv_image, np.array(hsv_lo), np.array(hsv_hi))
         
-        # Apply to ground region only
+        # Filter by ground mask and clean up
         color_mask = cv2.bitwise_and(color_mask, ground_binary)
-        # Remove speckle noise before labeling
-        try:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
-            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
-        except Exception:
-            pass
+        
+        # Small kernel to remove single-pixel noise without destroying thin lines
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
 
         num_labels, cc_labels, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
-        filtered = np.zeros((h, w), dtype=np.uint8)
-
         for label_id in range(1, num_labels):
-            area = stats[label_id, cv2.CC_STAT_AREA]
-            width = stats[label_id, cv2.CC_STAT_WIDTH]
-            height = stats[label_id, cv2.CC_STAT_HEIGHT]
-            aspect_ratio = max(width, height) / max(min(width, height), 1)
-
-            # Keep thin, elongated components that are large enough to be real floor lines.
-            if area < 20:
-                continue
-
-            component_mask = (cc_labels == label_id)
-            filtered[component_mask] = 255
-
-        # Assign class label where mask is positive
-        line_labels[filtered > 0] = class_id
-    
+            # Reduced area threshold slightly to catch distant line segments
+            if stats[label_id, cv2.CC_STAT_AREA] > 15:
+                line_labels[cc_labels == label_id] = class_id
+                
     return line_labels
+
 
 
 def ground_mask(
@@ -200,6 +171,9 @@ def ground_mask(
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.erode(mask, small_kernel, iterations=2)
     except Exception:
         pass
 

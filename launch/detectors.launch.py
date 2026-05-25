@@ -18,11 +18,17 @@ def generate_launch_description():
         Node(package=pkg, executable='line_detection.py',
              name='line_detection', output='screen'),
 
+        Node(package=pkg, executable='yellow_line_obstacle.py',
+             name='yellow_line_obstacle', output='screen'),
+
         Node(package=pkg, executable='anomaly_detector.py',
              name='anomaly_detector', output='screen'),
 
         Node(package=pkg, executable='qr_detector.py',
              name='qr_detector', output='screen'),
+
+        Node(package=pkg, executable='line_follower.py',
+             name='line_follower', output='screen'),
 
         # Required for QR fallback in dialogue: arm_mover_actions listens on
         # /arm_command and parks the wrist camera at the 'look_for_qr' pose;

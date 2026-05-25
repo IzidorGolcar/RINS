@@ -61,8 +61,7 @@ class RingDetector(Node):
 
         self.ring_map = RingMap()
 
-        cv2.namedWindow('Detections', cv2.WINDOW_NORMAL)
-        cv2.namedWindow('Segmentation', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Ring Detections', cv2.WINDOW_NORMAL)
 
     def cam_info_callback(self, msg):
         if self.fx is None:
@@ -135,18 +134,6 @@ class RingDetector(Node):
                     current_id += 1
         return label_map
 
-    def display_label_map(self, label_map):
-        unique_labels = np.unique(label_map)
-        areas = {label: np.sum(label_map == label) for label in unique_labels if label != 0}
-        sorted_labels = sorted(areas, key=lambda l: areas[l])
-        rank_map = np.zeros_like(label_map, dtype=np.uint8)
-        n = len(sorted_labels)
-        for rank, label in enumerate(sorted_labels):
-            color_idx = int(rank * 255 / max(n - 1, 1))
-            rank_map[label_map == label] = color_idx
-        colored_labels = cv2.applyColorMap(rank_map, cv2.COLORMAP_JET)
-        colored_labels[label_map == 0] = 0
-        cv2.imshow('Segmentation', colored_labels)
 
     def get_average_color(self, image_rgb, mask):
         mask_bool = mask.astype(bool)
@@ -164,7 +151,7 @@ class RingDetector(Node):
             cv2.ellipse(output, ellipse, ring_color, 2)
             label = f"RING"
             cv2.putText(output, label, (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ring_color, 1)
-        cv2.imshow('Detections', output)
+        cv2.imshow('Ring Detections', output)
 
     def is_grey(self, bgr: tuple[int, int, int], sat_threshold: int = 20) -> bool:
         pixel = np.uint8([[list(bgr)]])
@@ -379,7 +366,6 @@ class RingDetector(Node):
         roi_pixels, roi_mask = self.get_roi(img_rgb, img_depth)
         clusters = self.cluster_colors(roi_pixels, roi_mask)
         label_map = self.build_label_map(clusters)
-        self.display_label_map(label_map)
         rings = self.find_rings(label_map, img_rgb, img_depth)
         self.display_detections(img_rgb, rings)
 
