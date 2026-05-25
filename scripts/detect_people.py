@@ -439,8 +439,13 @@ class FaceDetector(Node):
             i = face['id']
             pos = face['pos']
             ident = face['identity']
-            label = (f'{ident.name} ({ident.role})'
-                     if ident is not None else f'Face {i}')
+            # Always prefix with "personN" (no space — RViz TEXT_VIEW_FACING
+            # renders space chars with huge padding). Append identity
+            # with underscores so it remains one compact token.
+            if ident is not None:
+                label = f'person{i}_{ident.name}_{ident.role}'
+            else:
+                label = f'person{i}'
             # Pink for she/her, cyan for he/him, neutral orange when unknown.
             if ident is None:
                 colour = (1.0, 0.4, 0.0)
@@ -449,21 +454,26 @@ class FaceDetector(Node):
             else:
                 colour = (0.0, 0.7, 1.0)
 
-            sphere = Marker()
-            sphere.header.frame_id = 'map'
-            sphere.header.stamp = now
-            sphere.ns = 'faces'
-            sphere.id = i
-            sphere.type = Marker.SPHERE
-            sphere.action = Marker.ADD
-            sphere.pose.position.x = float(pos[0])
-            sphere.pose.position.y = float(pos[1])
-            sphere.pose.position.z = float(pos[2])
-            sphere.pose.orientation.w = 1.0
-            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.3
-            sphere.color.r, sphere.color.g, sphere.color.b = colour
-            sphere.color.a = 1.0
-            ma.markers.append(sphere)
+            # Tall thin cylinder = "person pillar", visually distinct from
+            # ring spheres and barrel cubes. RViz doesn't ship a STAR
+            # marker type, and TRIANGLE_LIST would be overkill here.
+            person = Marker()
+            person.header.frame_id = 'map'
+            person.header.stamp = now
+            person.ns = 'faces'
+            person.id = i
+            person.type = Marker.CYLINDER
+            person.action = Marker.ADD
+            person.pose.position.x = float(pos[0])
+            person.pose.position.y = float(pos[1])
+            person.pose.position.z = float(pos[2])
+            person.pose.orientation.w = 1.0
+            person.scale.x = 0.10
+            person.scale.y = 0.10
+            person.scale.z = 0.40
+            person.color.r, person.color.g, person.color.b = colour
+            person.color.a = 1.0
+            ma.markers.append(person)
 
             text_marker = Marker()
             text_marker.header.frame_id = 'map'
@@ -476,8 +486,10 @@ class FaceDetector(Node):
             text_marker.pose.position.y = float(pos[1])
             text_marker.pose.position.z = float(pos[2]) + 0.45
             text_marker.pose.orientation.w = 1.0
-            text_marker.scale.z = 0.22
-            text_marker.color.r = text_marker.color.g = text_marker.color.b = 1.0
+            text_marker.scale.z = 0.30
+            text_marker.color.r = 1.0
+            text_marker.color.g = 0.0
+            text_marker.color.b = 0.0
             text_marker.color.a = 1.0
             text_marker.text = label
             ma.markers.append(text_marker)

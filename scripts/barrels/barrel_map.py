@@ -8,9 +8,20 @@ import numpy as np
 
 
 # Constants used by the tracker. See plan for rationale.
-MERGE_DIST = 0.45     # m (prevent side-by-side barrels from merging)
-CONFIRM_OBS = 12
-CONFIRM_TRACE = 0.20
+MERGE_DIST = 0.8     # m. Trade-off: barrels are up to 0.80 m wide, so
+                      # two distinct barrels could sit centres ~0.80 m
+                      # apart — MERGE_DIST must stay safely below that
+                      # to avoid fusing real neighbours. 0.65 m still
+                      # comfortably exceeds typical centroid noise
+                      # (~50 cm from side-on views) so the same
+                      # physical barrel doesn't split into two landmarks.
+# Loosened so briefly-glimpsed barrels still appear in RViz. Tuning:
+#   - CONFIRM_OBS    : was 12  → now 6  (3 s @ 2 Hz, or fewer frames
+#                      from a single fly-past).
+#   - CONFIRM_TRACE  : was 0.20 → now 0.40 (covariance still
+#                      shrinking on noisy single-view sightings).
+CONFIRM_OBS = 9
+CONFIRM_TRACE = 0.30
 
 # Outlier gate: chi-squared 3 DoF, p=0.05
 MAHAL_GATE = 7.815
@@ -46,12 +57,15 @@ class BarrelLandmark:
 
     @property
     def orientation(self) -> str:
-        """Mode orientation, requires >=70% majority else 'ambiguous'."""
+        """Mode orientation, requires >=50% plurality else 'ambiguous'.
+        Was 70% — relaxed so barrels seen from mixed angles (where
+        vertical/horizontal classification flips occasionally) still
+        get marked."""
         if not self.orientation_history:
             return 'ambiguous'
         counts = Counter(self.orientation_history)
         top, n = counts.most_common(1)[0]
-        if n / len(self.orientation_history) >= 0.7:
+        if n / len(self.orientation_history) >= 0.5:
             return top
         return 'ambiguous'
 

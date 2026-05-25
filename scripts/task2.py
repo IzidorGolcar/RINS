@@ -43,7 +43,8 @@ from nav2_msgs.msg import SpeedLimit
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                         QoSProfile, QoSReliabilityPolicy,
                         qos_profile_sensor_data)
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, PointCloud2
+from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import MarkerArray
 
@@ -58,18 +59,18 @@ from inspection_report import (  # noqa: E402
 
 # ---- Tunables -------------------------------------------------------------
 
-APPROACH_DIST = 0.30        # m — stand-off when greeting a worker. Must be < (face MIN_DIST=0.5 - nav2 xy_goal_tolerance=0.22) so even a face confirmed at min range forces a visible move.
+APPROACH_DIST = 0.40        # m — stand-off when greeting a worker. Must be < (face MIN_DIST=0.5 - nav2 xy_goal_tolerance=0.22) so even a face confirmed at min range forces a visible move.
 # Positive = counter-clockwise (look further left). The QR card sits to the
 # left of the face from the viewer's POV, so aiming a bit left of the face
 # brings the QR into the OAK-D's FoV for both dialogue + standalone QR scan.
-FACE_YAW_BIAS_DEG = 30.0
+FACE_YAW_BIAS_DEG = 25.0
 SAFETY_BACKUP_DIST = 0.08   # m — reverse this far when /yellow_alert fires
 SAFETY_BACKUP_VEL  = -0.10  # m/s
 BLUE_FOLLOW_TIMEOUT = 2.0   # s — stop following if line vanishes for longer
 BLUE_GOAL_REPLAN_PERIOD = 0.5  # s — how often we re-publish a blue follow goal
 EXIT_FIRST_ROOM_GOAL = (3.0, -0.5, -90.0)   # (x, y, yaw_deg) — blue-line entrance
 CTO_NAME = 'jeff'  # see personnel/jeff_he_him_cto.png
-FACES_TO_VISIT = 3          # hardcoded count of workers in the first room
+FACES_TO_VISIT = 4          # hardcoded count of workers in the first room
                             # (we leave once all are greeted; some may
                             # decline a task and that's fine)
 
@@ -126,6 +127,10 @@ class Task2Node(RobotCommander):
         # Line state
         self._yellow_alert = False
         self._last_yellow_alert_at = 0.0
+        # Accumulated yellow no-go points in MAP frame. Quantised to a
+        # 5 cm grid (see `_yellow_cloud_cb`) so the set stays bounded
+        # while still capturing every line the camera has ever seen.
+        self._yellow_pts: set[tuple[int, int]] = set()
         self._blue_target: PoseStamped | None = None
         self._last_blue_target_at = 0.0
         self._cell_seen: str | None = None
@@ -192,8 +197,15 @@ class Task2Node(RobotCommander):
             # dispatches a task before exploration has found them all,
             # the robot drives more coverage waypoints until the count
             # is met (see `_explore_until`).
-            ('total_barrels', 7),
+            ('total_barrels', 8),
             ('total_rings',   3),
+            # Hardcoded CTO pose for testing while blue-line follow is
+            # unreliable. When `use_hardcoded_cto` is True we skip
+            # FOLLOW_BLUE_LINE entirely and drive straight to `cto_xy`
+            # (Nav2). Set to False once blue-line follow works.
+            ('use_hardcoded_cto', True),
+            ('cto_xy',     '-2.42,-8.91'),
+            ('cto_yaw_deg', 180.0),
         ])
 
         # Subscriptions
@@ -208,6 +220,11 @@ class Task2Node(RobotCommander):
         self.create_subscription(MarkerArray,   '/ring_markers',  self._ring_marker_cb, 10)
         self.create_subscription(MarkerArray,   '/tile_markers',  self._tile_marker_cb, 10)
         self.create_subscription(Bool,          '/lines/yellow_alert', self._yellow_cb, 10)
+        # Accumulate every detected yellow point so we can pre-check
+        # whether a waypoint sits behind a yellow line.
+        self.create_subscription(PointCloud2,   '/lines/yellow_obstacles',
+                                 self._yellow_cloud_cb,
+                                 qos_profile_sensor_data)
         self.create_subscription(PoseStamped,   '/lines/blue_target',  self._blue_cb,   10)
         self.create_subscription(String,        '/lines/cell_detected', self._cell_cb,  10)
         self.create_subscription(PoseStamped,   '/lines/red_cell_pose',
@@ -332,6 +349,51 @@ class Task2Node(RobotCommander):
         if self._yellow_alert:
             self._last_yellow_alert_at = time.monotonic()
 
+    def _yellow_cloud_cb(self, msg: PointCloud2) -> None:
+        """Add map-frame yellow points to the accumulator (5 cm grid)."""
+        if msg.header.frame_id != 'map':
+            # Cloud should be in map frame per line_detection.py; bail
+            # gracefully if not, no fix-up here.
+            return
+        for x, y, _z in pc2.read_points(msg, field_names=('x', 'y', 'z'),
+                                          skip_nans=True):
+            self._yellow_pts.add((int(round(float(x) * 20.0)),
+                                   int(round(float(y) * 20.0))))
+
+    def _path_blocked_by_yellow(self, start: tuple[float, float],
+                                  goal: tuple[float, float],
+                                  clearance: float = 0.15) -> bool:
+        """True if the straight line from start to goal passes within
+        `clearance` m of any seen yellow point.
+
+        Vectorised: O(N) where N is the count of accumulated yellow
+        points. We project each point onto the segment, clamp to [0, L]
+        so we only consider points that are actually between start and
+        goal (not behind either endpoint), then compare distance.
+        """
+        if not self._yellow_pts:
+            return False
+        sx, sy = float(start[0]), float(start[1])
+        gx, gy = float(goal[0]), float(goal[1])
+        dx, dy = gx - sx, gy - sy
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-6:
+            return False  # zero-length segment
+
+        # 5 cm grid → divide by 20 to recover metres.
+        pts = np.array(list(self._yellow_pts), dtype=np.float32) / 20.0
+        if pts.size == 0:
+            return False
+        px = pts[:, 0] - sx
+        py = pts[:, 1] - sy
+        # Parametric projection t in [0, 1] along the segment.
+        t = (px * dx + py * dy) / seg_len_sq
+        t = np.clip(t, 0.0, 1.0)
+        fx = t * dx
+        fy = t * dy
+        d2 = (px - fx) ** 2 + (py - fy) ** 2
+        return bool((d2 < clearance * clearance).any())
+
     def _blue_cb(self, msg: PoseStamped) -> None:
         self._blue_target = msg
         self._last_blue_target_at = time.monotonic()
@@ -356,12 +418,28 @@ class Task2Node(RobotCommander):
     def _green_cell_pose_cb(self, msg: PoseStamped) -> None:
         self._green_cell_pose = msg
 
+    def _in_first_room(self, x: float, y: float) -> bool:
+        """True if (x, y) lies inside the first-room AABB. Barrels and
+        rings detected outside this box are noise (second-room sightings,
+        sensor artefacts) and get ignored."""
+        x_min = float(self.get_parameter('first_room_x_min').get_parameter_value().double_value)
+        x_max = float(self.get_parameter('first_room_x_max').get_parameter_value().double_value)
+        y_min = float(self.get_parameter('first_room_y_min').get_parameter_value().double_value)
+        y_max = float(self.get_parameter('first_room_y_max').get_parameter_value().double_value)
+        return (x_min <= x <= x_max) and (y_min <= y <= y_max)
+
     def _barrel_marker_cb(self, msg: MarkerArray) -> None:
         for m in msg.markers:
             if m.ns != 'confirmed_barrels':
                 continue
+            x, y = m.pose.position.x, m.pose.position.y
+            if not self._in_first_room(x, y):
+                # Drop any stale entry for this id too, in case the same
+                # barrel id was previously stored when it was inside.
+                self.barrels.pop(m.id, None)
+                continue
             entry = self.barrels.setdefault(m.id, {})
-            entry['position'] = (m.pose.position.x, m.pose.position.y, m.pose.position.z)
+            entry['position'] = (x, y, m.pose.position.z)
 
     def _barrel_json_cb(self, msg: String) -> None:
         try:
@@ -374,14 +452,22 @@ class Task2Node(RobotCommander):
             bid = int(entry.get('id', -1))
             if bid < 0:
                 continue
+            pos = entry.get('position') or [0.0, 0.0, 0.0]
+            if not self._in_first_room(float(pos[0]), float(pos[1])):
+                self.barrels.pop(bid, None)
+                continue
             self.barrels[bid] = entry  # full JSON snapshot replaces local store
 
     def _ring_marker_cb(self, msg: MarkerArray) -> None:
         for m in msg.markers:
             if m.ns != 'confirmed_rings':
                 continue
+            x, y = m.pose.position.x, m.pose.position.y
+            if not self._in_first_room(x, y):
+                self.rings.pop(m.id, None)
+                continue
             self.rings[m.id] = {
-                'position': (m.pose.position.x, m.pose.position.y, m.pose.position.z),
+                'position': (x, y, m.pose.position.z),
                 'color_rgb': (m.color.r, m.color.g, m.color.b),
             }
 
@@ -645,6 +731,46 @@ class Task2Node(RobotCommander):
             return False
         return True
 
+    def _wait_belt_subgoal(self, stuck_timeout_s: float = 8.0,
+                            stuck_distance: float = 0.04) -> bool:
+        """Like _wait_nav_with_safety but cancels early when the robot
+        doesn't move at least `stuck_distance` within `stuck_timeout_s`.
+        Used during the belt sub-goal loop so a stuck robot recovers in
+        seconds instead of waiting out Nav2's full retry loop.
+        """
+        last_pos = None
+        last_move_t = time.monotonic()
+        if self.current_pose is not None:
+            last_pos = (self.current_pose.pose.position.x,
+                        self.current_pose.pose.position.y)
+        while not self.isTaskComplete():
+            self._spin_ros()
+            if self._check_yellow_safety():
+                return False
+            if self.current_pose is not None:
+                cur = (self.current_pose.pose.position.x,
+                       self.current_pose.pose.position.y)
+                if last_pos is None:
+                    last_pos = cur
+                    last_move_t = time.monotonic()
+                else:
+                    moved = math.hypot(cur[0] - last_pos[0],
+                                        cur[1] - last_pos[1])
+                    if moved >= stuck_distance:
+                        last_pos = cur
+                        last_move_t = time.monotonic()
+                    elif time.monotonic() - last_move_t > stuck_timeout_s:
+                        self.warn(f'Belt sub-goal stuck (no '
+                                  f'{stuck_distance:.2f} m in '
+                                  f'{stuck_timeout_s:.0f} s) — cancelling.')
+                        self.cancelTask()
+                        return False
+        result = self.getResult()
+        if result and str(result) != 'TaskResult.SUCCEEDED':
+            self.warn(f'Belt sub-goal nav finished non-success: {result}')
+            return False
+        return True
+
     # ---- Main loop ---------------------------------------------------------
 
     def run(self) -> None:
@@ -707,6 +833,13 @@ class Task2Node(RobotCommander):
                     continue
 
                 wp = self.coverage_waypoints[self.waypoint_idx]
+                # Yellow handling moved to Nav2: the costmap layer +
+                # reactive _check_yellow_safety route us around yellow
+                # zones. We no longer pre-reject waypoints here — that
+                # was too aggressive (one accumulated cluster could
+                # block every remaining goal). If Nav2 can't reach a
+                # waypoint, `_wait_nav_with_safety()` returns False and
+                # the existing fallthrough advances to the next one.
                 self.info(f'Coverage waypoint {self.waypoint_idx + 1}/'
                           f'{len(self.coverage_waypoints)}: ({wp[0]:.2f}, {wp[1]:.2f})')
                 self._go_waypoint(*wp)
@@ -853,6 +986,11 @@ class Task2Node(RobotCommander):
                     self.state = State.APPROACH_PERSON
                 elif self._yellow_alert:
                     self.state = State.EXIT_FIRST_ROOM
+                elif self._use_hardcoded_cto():
+                    # Blue-line follow is brittle; for testing we jump
+                    # straight to the hardcoded CTO location.
+                    self.info('Hardcoded CTO mode — skipping FOLLOW_BLUE_LINE.')
+                    self.state = State.REPORT_TO_CTO
                 else:
                     self.state = State.FOLLOW_BLUE_LINE
 
@@ -904,12 +1042,14 @@ class Task2Node(RobotCommander):
                         break
 
             elif self.state == State.REPORT_TO_CTO:
-                fid = self._cto_face_id
-                if fid is None or fid not in self.known_faces:
-                    self.warn('Lost track of CTO; backing to FOLLOW_BLUE_LINE.')
+                cto_xy = self._resolve_cto_xy()
+                if cto_xy is None:
+                    self.warn('Lost track of CTO and no hardcoded fallback; '
+                              'backing to FOLLOW_BLUE_LINE.')
                     self.state = State.FOLLOW_BLUE_LINE
                     continue
-                fx, fy, _ = self.known_faces[fid]['pos']
+                fx, fy = cto_xy
+                self.info(f'Reporting to CTO at ({fx:.2f},{fy:.2f}).')
                 self.goToPose(self._approach_pose(fx, fy))
                 self._wait_nav_with_safety()
                 self._face_person(fx, fy)
@@ -1249,9 +1389,9 @@ class Task2Node(RobotCommander):
         #    5 s after `look_at_belt_left` so the arm is FULLY in the
         #    scanning position before the robot starts moving.
         self._arm('up')
-        time.sleep(4.0)
+        time.sleep(5.0)
         self._arm('look_at_belt_left')
-        time.sleep(9.0)
+        time.sleep(12.0)
 
         # 4) DRIVE TO END POINT via SEQUENCED Nav2 sub-goals.
         #    Split the start→end line into short Nav2 hops (every ~0.5 m),
@@ -1287,7 +1427,8 @@ class Task2Node(RobotCommander):
                 self.info(f'Belt sub-goal {i}/{n_steps} at '
                           f'({sub_x:.2f}, {sub_y:.2f}).')
                 self.goToPose(sub_pose)
-                if not self._wait_nav_with_safety():
+                if not self._wait_belt_subgoal(stuck_timeout_s=8.0,
+                                                stuck_distance=0.04):
                     consecutive_fails += 1
                     self.warn(f'Belt sub-goal {i}/{n_steps} did not '
                               f'succeed (consecutive fails: '
@@ -1336,6 +1477,26 @@ class Task2Node(RobotCommander):
             pass
         self.warn(f'Bad parameter {name}={raw!r}; expected "x,y".')
         return None
+
+    def _use_hardcoded_cto(self) -> bool:
+        return bool(
+            self.get_parameter('use_hardcoded_cto')
+            .get_parameter_value().bool_value)
+
+    def _resolve_cto_xy(self) -> tuple[float, float] | None:
+        """Pick the CTO target: hardcoded param or detected face pose.
+
+        - If `use_hardcoded_cto` is True → always use the `cto_xy` param.
+        - Else, prefer the detected CTO face position; fall back to the
+          hardcoded `cto_xy` if no face was registered.
+        """
+        if self._use_hardcoded_cto():
+            return self._parse_xy_param('cto_xy')
+        fid = self._cto_face_id
+        if fid is not None and fid in self.known_faces:
+            fx, fy, _ = self.known_faces[fid]['pos']
+            return float(fx), float(fy)
+        return self._parse_xy_param('cto_xy')
 
     def _drive_distance(self, target_distance: float, velocity: float,
                          cell_colour: str | None = None,
@@ -1588,8 +1749,17 @@ class Task2Node(RobotCommander):
     # ---- Final report -----------------------------------------------------
 
     def _finalize_report(self) -> None:
-        out_dir = os.path.expanduser('~/.ros')
+        # Save the inspection report inside the repo's `reports/` folder
+        # so it's easy to find next to the source. Resolves the symlink
+        # at install time too — __file__ comes back through
+        # install/dis_tutorial3/lib/dis_tutorial3/task2.py which is a
+        # symlink (with `--symlink-install`) to the source tree.
+        script_path = os.path.realpath(__file__)
+        # script_path = .../RINS/scripts/task2.py → repo = .../RINS
+        repo_root = os.path.dirname(os.path.dirname(script_path))
+        out_dir = os.path.join(repo_root, 'reports')
         try:
+            os.makedirs(out_dir, exist_ok=True)
             path = self.report.finalize(out_dir=out_dir)
         except Exception as e:
             self.error(f'Failed to write inspection report: {e}')

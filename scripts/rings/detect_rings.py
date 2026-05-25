@@ -3,6 +3,7 @@
 import rclpy
 from rclpy.node import Node
 import cv2, math
+from typing import Optional
 import numpy as np
 import tf2_ros
 
@@ -170,6 +171,29 @@ class RingDetector(Node):
         s = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0, 0, 1]
         return int(s) <= sat_threshold
 
+    def _classify_ring_color(self, bgr: tuple[int, int, int]) -> Optional[str]:
+        """Map a BGR triple to one of the allowed ring colours.
+
+        Per spec, rings are only red / green / blue / black. Anything
+        else returns None and the candidate is rejected.
+        """
+        b, g, r = int(bgr[0]), int(bgr[1]), int(bgr[2])
+        # Black: all channels dark.
+        if max(b, g, r) < 60:
+            return 'black'
+        # Red dominant.
+        if r > 100 and r > g + 30 and r > b + 30:
+            return 'red'
+        # Green dominant.
+        if g > 80 and g > r + 20 and g > b + 20:
+            return 'green'
+        # Blue dominant. Loosened from (b > 80, +20 dominance) to catch
+        # darker blues — the ring sometimes registers around B≈55–80
+        # which previously fell into "unknown".
+        if b > 45 and b > r + 12 and b > g + 12:
+            return 'blue'
+        return None
+
 
 
     def find_rings(self, label_map, img_rgb, img_depth):
@@ -184,6 +208,11 @@ class RingDetector(Node):
             ring_color = self.get_average_color(img_rgb, mask)
 
             if self.is_grey(ring_color):
+                continue
+            # Per-spec constraint: rings are only red / green / blue / black.
+            # Reject anything that doesn't classify cleanly.
+            colour_name = self._classify_ring_color(ring_color)
+            if colour_name is None:
                 continue
             
 
@@ -217,6 +246,7 @@ class RingDetector(Node):
                         results.append({
                             'ellipse': ellipse,
                             'color': ring_color,
+                            'color_name': colour_name,
                             'depth': avg_ring_depth
                         })
         return results
@@ -254,19 +284,55 @@ class RingDetector(Node):
                 continue
 
             pos = np.array([pt_world.point.x, pt_world.point.y, pt_world.point.z])
-            self.ring_map.update(pos, ring['color'])
+            self.ring_map.update(pos, ring['color'],
+                                  color_name=ring.get('color_name', 'unknown'))
 
         self._publish_confirmed()
 
 
     def _publish_confirmed(self):
         confirmed = self.ring_map.confirmed_landmarks()
-        
+        # Defence-in-depth: drop any landmark whose colour didn't classify
+        # as one of the allowed ring colours, even if it somehow ended
+        # up in the map. Rings are red / green / blue / black ONLY.
+        ALLOWED = {'red', 'green', 'blue', 'black'}
+        confirmed = [
+            lm for lm in confirmed
+            if getattr(lm, 'color_name', None) in ALLOWED
+        ]
+        # Drop rings detected outside the first-room AABB (second-room
+        # / outside-map hits are noise; rings only live in room 1).
+        FIRST_ROOM_AABB = (-4.5, 1.4, -4.5, 0.7)  # x_min, x_max, y_min, y_max
+        x_min, x_max, y_min, y_max = FIRST_ROOM_AABB
+        confirmed = [
+            lm for lm in confirmed
+            if x_min <= float(lm.position[0]) <= x_max
+            and y_min <= float(lm.position[1]) <= y_max
+        ]
+
         now = self.get_clock().now().to_msg()
         marker_array = MarkerArray()
 
-        for lm in confirmed:
-            
+        # On the very first publish, send a DELETEALL so any stale ring
+        # markers cached in RViz from a previous node run get cleared.
+        if not getattr(self, '_marker_cleared', False):
+            clear = Marker()
+            clear.header.frame_id = 'map'
+            clear.header.stamp = now
+            clear.ns = 'confirmed_rings'
+            clear.action = Marker.DELETEALL
+            marker_array.markers.append(clear)
+            clear_labels = Marker()
+            clear_labels.header.frame_id = 'map'
+            clear_labels.header.stamp = now
+            clear_labels.ns = 'confirmed_rings_labels'
+            clear_labels.action = Marker.DELETEALL
+            marker_array.markers.append(clear_labels)
+            self._marker_cleared = True
+
+        for display_n, lm in enumerate(confirmed, start=1):
+
+            # Small coloured dot at the ring's map position.
             sphere = Marker()
             b, g, r = [c / 255.0 for c in lm.color]
             sphere.header.frame_id = 'map'
@@ -279,12 +345,16 @@ class RingDetector(Node):
             sphere.pose.position.y = float(lm.position[1])
             sphere.pose.position.z = float(lm.position[2])
             sphere.pose.orientation.w = 1.0
-            sphere.scale = Vector3(x=0.15, y=0.15, z=0.15)
+            sphere.scale = Vector3(x=0.10, y=0.10, z=0.10)
             sphere.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
             sphere.lifetime.sec = 0
-
             marker_array.markers.append(sphere)
 
+            # Floating red label so it's easy to spot in RViz. We number
+            # by position in confirmed_landmarks() (1..N dense) so
+            # discarded/unconfirmed landmarks don't leave gaps in the
+            # visible numbering. Marker `id` still uses lm.id to keep
+            # marker identity stable across publishes.
             label = Marker()
             label.header.frame_id = 'map'
             label.header.stamp = now
@@ -292,13 +362,14 @@ class RingDetector(Node):
             label.id = lm.id
             label.type = Marker.TEXT_VIEW_FACING
             label.action = Marker.ADD
-            sphere.pose.position.x = float(lm.position[0])
-            sphere.pose.position.y = float(lm.position[1])
-            sphere.pose.position.z = float(lm.position[2])
+            label.pose.position.x = float(lm.position[0])
+            label.pose.position.y = float(lm.position[1])
+            label.pose.position.z = float(lm.position[2]) + 0.20
             label.pose.orientation.w = 1.0
-            sphere.scale = Vector3(x=0.15, y=0.15, z=0.15)
-            label.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
-            label.text = f'Ring {lm.id}'
+            label.scale = Vector3(x=0.0, y=0.0, z=0.30)
+            label.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+            label.text = f'ring{display_n}'
+            label.lifetime.sec = 0
             marker_array.markers.append(label)
 
         if len(marker_array.markers) > 0:

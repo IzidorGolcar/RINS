@@ -86,7 +86,8 @@ AUDIO_BLOCK = 8000
 MAX_LISTEN_S = 8.0           # hard timeout on a single utterance
 MAX_REASK = 2                # cap the woman re-ask loop
 QR_ARM_SETTLE_S = 2.5
-QR_FRAME_WAIT_S = 5.0
+QR_FRAME_WAIT_S = 10.0   # bumped from 5 s — give OAK-D more frames to
+                         # lock onto the QR card when the robot is jittery
 ESPEAK_RATE = 140
 ESPEAK_VOICE = 'en-us'
 
@@ -279,20 +280,26 @@ class DialogueNode(Node):
         if first is None or first.intent is None:
             return self._qr_fallback()
 
-        # If voice classified as 'nothing' (often a mishearing of ambient
-        # noise / TTS bleed-through), double-check the QR card before
-        # accepting. The QR is the authoritative source — if it carries
-        # a real task, use that instead of the voice's "nothing".
-        if first.intent == INTENT_NOTHING:
+        # Always cross-check the QR card. Voice is unreliable (Vosk
+        # picks up TTS bleed-through / ambient noise and frequently
+        # mismatches). The worker holds a QR card next to their face —
+        # that text is the authoritative source of the task. If QR
+        # disagrees with voice, QR wins.
+        self.get_logger().info(
+            f'Voice intent={first.intent!r} (raw={first.raw!r}); '
+            'cross-checking with QR.')
+        qr_intent, qr_raw, qr_source = self._qr_fallback()
+        if qr_intent is not None and qr_intent != first.intent:
             self.get_logger().info(
-                f'Voice classified as "nothing" (raw={first.raw!r}); '
-                'cross-checking with QR before accepting.')
-            qr_intent, qr_raw, qr_source = self._qr_fallback()
-            if qr_intent is not None and qr_intent != INTENT_NOTHING:
-                self.get_logger().info(
-                    f'QR overrides voice: {qr_intent!r} wins over "nothing".')
-                return qr_intent, qr_raw, qr_source
-            # QR also said nothing or was unreadable → trust the voice.
+                f'QR overrides voice: QR={qr_intent!r} '
+                f'wins over voice={first.intent!r}.')
+            return qr_intent, qr_raw, qr_source
+        if qr_intent is None:
+            self.get_logger().info(
+                f'QR unreadable or absent; sticking with voice={first.intent!r}.')
+        # QR agrees with voice OR QR absent — keep the voice path,
+        # which may still go through the female re-ask flow below.
+        if first.intent == INTENT_NOTHING:
             return first.intent, first.raw, 'voice'
 
         if gender == 'male':
@@ -401,26 +408,40 @@ class DialogueNode(Node):
         """
         deadline = time.monotonic() + window_s
         payload: str = ''
+        scans = 0
+        decoded_any = False
         while time.monotonic() < deadline and rclpy.ok():
             with self._image_lock:
                 img = self._latest_images.get(cam)
                 img = img.copy() if img is not None else None
             if img is not None:
+                scans += 1
                 for code in pyzbar.decode(img):
+                    decoded_any = True
                     text = code.data.decode('utf-8', errors='ignore').strip()
+                    self.get_logger().info(
+                        f'QR decoded on {cam} (type={code.type}): {text!r}')
                     if not text:
                         continue
                     # 1. Sentence parser (handles full prose).
                     parsed = classify(text)
                     candidate = parsed.intent
+                    self.get_logger().info(
+                        f'QR classify({text!r}) → {candidate!r}')
                     # 2. Dict-keyed fallback (legacy short QR payloads).
                     if candidate is None:
                         candidate = classify_qr(text)
+                        self.get_logger().info(
+                            f'QR classify_qr({text!r}) → {candidate!r}')
                     if candidate is not None:
                         return candidate, text
                     if not payload:
                         payload = text  # keep first unrecognised payload for logging
             time.sleep(0.15)
+        self.get_logger().info(
+            f'QR scan window ({window_s:.1f}s) ended on {cam}: '
+            f'{scans} frames inspected, decoded_any={decoded_any}, '
+            f'last_payload={payload!r}.')
         return None, payload
 
     # ------------------------------------------------------------------- TTS

@@ -59,7 +59,7 @@ class AnomalyDetector(Node):
         pkg_dir = get_package_share_directory('dis_tutorial3')
         model_path = os.path.join(pkg_dir, 'models', 'anomaly_detector.pt')
 
-        self.segmentation_model = SegmentationModel(model_path, device="cpu")
+        self.segmentation_model = SegmentationModel(model_path, device="cuda")
         self.tiles = []
         self._latest_depth = None
         self._latest_depth_frame = None

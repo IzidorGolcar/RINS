@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -44,7 +45,11 @@ COLOUR_RANGES: dict[str, list[tuple[int, int, int, int, int, int]]] = {
     'red':    [(0, 120, 80, 10, 255, 255), (170, 120, 80, 180, 255, 255)],
     'orange': [(11, 130, 110, 22, 255, 255)],
     'yellow': [(23, 120, 120, 35, 255, 255)],
-    'green':  [(40, 100, 50, 85, 255, 255)],
+    # Only LIGHT green barrels — dark green is rejected by the V_lo
+    # floor. Set to 100 (originally 50 accepted everything; 140 was
+    # too aggressive and rejected real light-green barrels). Tune
+    # between 80 and 130 if needed.
+    'green':  [(40, 100, 100, 85, 255, 255)],
     'blue':   [(95, 120, 50, 130, 255, 255)],
     'purple': [(131, 100, 50, 160, 255, 255)],
     'brown':  [(0, 80, 30, 22, 200, 110)],
@@ -656,33 +661,30 @@ class BarrelDetector(Node):
 
         now = self.get_clock().now().to_msg()
         ma = MarkerArray()
-        for lm in confirmed:
+        for display_n, lm in enumerate(confirmed, start=1):
             r, g, b = COLOUR_RGB.get(lm.colour, COLOUR_RGB['unknown'])
 
-            # Cylinder.
-            cyl = Marker()
-            cyl.header.frame_id = 'map'
-            cyl.header.stamp = now
-            cyl.ns = NS_BARREL
-            cyl.id = lm.id
-            cyl.type = Marker.CYLINDER
-            cyl.action = Marker.ADD
-            cyl.pose.position.x = float(lm.position[0])
-            cyl.pose.position.y = float(lm.position[1])
-            cyl.pose.position.z = float(lm.position[2])
-            if lm.orientation == 'horizontal':
-                # Lay the cylinder on its side; orient along world X for now.
-                # (We have no reliable per-barrel yaw measurement; the centroid
-                # placement is what matters for the report.)
-                cyl.pose.orientation = axis_to_quat(np.array([1.0, 0.0, 0.0]))
-            else:
-                cyl.pose.orientation.w = 1.0
-            cyl.scale = Vector3(x=0.55, y=0.55, z=0.88)
-            cyl.color = ColorRGBA(r=r, g=g, b=b, a=0.85)
-            cyl.lifetime.sec = 0
-            ma.markers.append(cyl)
+            # Small coloured cube — distinguishable from ring SPHERE and
+            # face SPHERE markers in RViz at a glance.
+            cube = Marker()
+            cube.header.frame_id = 'map'
+            cube.header.stamp = now
+            cube.ns = NS_BARREL
+            cube.id = lm.id
+            cube.type = Marker.CUBE
+            cube.action = Marker.ADD
+            cube.pose.position.x = float(lm.position[0])
+            cube.pose.position.y = float(lm.position[1])
+            cube.pose.position.z = float(lm.position[2])
+            cube.pose.orientation.w = 1.0
+            cube.scale = Vector3(x=0.20, y=0.20, z=0.20)
+            cube.color = ColorRGBA(r=r, g=g, b=b, a=0.95)
+            cube.lifetime.sec = 0
+            ma.markers.append(cube)
 
-            # Label.
+            # Compact red label; numbered by enumerate index so deleted /
+            # rejected landmarks don't leave gaps (e.g. "barrel 2" with
+            # only one barrel actually visible).
             lbl = Marker()
             lbl.header.frame_id = 'map'
             lbl.header.stamp = now
@@ -692,12 +694,12 @@ class BarrelDetector(Node):
             lbl.action = Marker.ADD
             lbl.pose.position.x = float(lm.position[0])
             lbl.pose.position.y = float(lm.position[1])
-            lbl.pose.position.z = float(lm.position[2]) + 0.7
+            lbl.pose.position.z = float(lm.position[2]) + 0.30
             lbl.pose.orientation.w = 1.0
-            lbl.scale = Vector3(x=0.0, y=0.0, z=0.18)
-            lbl.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            leak_suffix = ' / LEAKING' if lm.leaking else ''
-            lbl.text = f'Barrel {lm.id}: {lm.colour}/{lm.orientation}{leak_suffix}'
+            lbl.scale = Vector3(x=0.0, y=0.0, z=0.30)
+            lbl.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+            leak_suffix = '_LEAK' if lm.leaking else ''
+            lbl.text = f'barrel{display_n}{leak_suffix}'
             lbl.lifetime.sec = 0
             ma.markers.append(lbl)
 

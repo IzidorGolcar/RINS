@@ -9,6 +9,7 @@ class RingLandmark:
     covariance: np.ndarray
     observations: int = 0
     color_history: list = field(default_factory=list)
+    color_name_history: list = field(default_factory=list)
 
     @property
     def color(self) -> tuple:
@@ -16,6 +17,14 @@ class RingLandmark:
             return (0, 0, 0)
         arr = np.array(self.color_history, dtype=np.uint8)
         return tuple(np.median(arr, axis=0).astype(np.uint8).tolist())
+
+    @property
+    def color_name(self) -> str:
+        if not self.color_name_history:
+            return 'unknown'
+        # Majority vote over the history.
+        from collections import Counter
+        return Counter(self.color_name_history).most_common(1)[0][0]
 
     CONFIRM_OBS   = 10
     CONFIRM_TRACE = 0.16
@@ -37,7 +46,7 @@ class RingMap:
                 best_i, best_d = i, d
         return (best_i, best_d) if best_i is not None else None
 
-    def update(self, pos: np.ndarray, color: tuple):
+    def update(self, pos: np.ndarray, color: tuple, color_name: str = 'unknown'):
         nearest = self._nearest(pos)
 
         if nearest is None or nearest[1] > RingLandmark.MERGE_DIST:
@@ -46,7 +55,8 @@ class RingMap:
                 position=pos.copy(),
                 covariance=np.eye(3) * 2.0,
                 observations=1,
-                color_history=[color]
+                color_history=[color],
+                color_name_history=[color_name],
             )
             self.landmarks.append(lm)
         else:
@@ -71,6 +81,7 @@ class RingMap:
             lm.covariance = (np.eye(3) - K) @ P_pred
             lm.observations += 1
             lm.color_history.append(color)
+            lm.color_name_history.append(color_name)
 
     def confirmed_landmarks(self) -> List[RingLandmark]:
         for lm in self.landmarks:
