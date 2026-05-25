@@ -46,6 +46,11 @@ controller_server:
       yaw_goal_tolerance: 0.15
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      # Throttleable via /speed_limit (nav2_msgs/SpeedLimit) — task2
+      # publishes a low limit during the conveyor-belt inspection so
+      # anomaly_detector gets enough frames per tile, and clears it
+      # afterwards for full speed in the rest of the mission.
+      speed_limit_topic: "speed_limit"
       desired_linear_vel: 0.975
       lookahead_dist: 0.9
       min_lookahead_dist: 0.55
@@ -96,7 +101,7 @@ local_costmap:
         z_voxels: 16
         max_obstacle_height: 2.0
         mark_threshold: 0
-        observation_sources: scan_filtered
+        observation_sources: scan_filtered line_obstacles
         scan_filtered:
           topic: scan_filtered
           max_obstacle_height: 2.0
@@ -107,6 +112,21 @@ local_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+        # Yellow no-go lines published by line_detection.py. We use
+        # clearing: true so old markings don't accumulate (which would
+        # eventually choke off all paths — observed in field testing).
+        # The reactive _check_yellow_safety in task2 is the persistent
+        # safety net.
+        line_obstacles:
+          topic: /lines/yellow_obstacles
+          max_obstacle_height: 0.2
+          clearing: true
+          marking: true
+          data_type: "PointCloud2"
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
@@ -126,7 +146,7 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan
+        observation_sources: scan line_obstacles
         scan:
           topic: scan
           max_obstacle_height: 2.0
@@ -137,6 +157,19 @@ global_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+        # Yellow lines persist in the global costmap so any future
+        # plan routes around them, even after the robot has driven
+        # past the original detection point.
+        line_obstacles:
+          topic: /lines/yellow_obstacles
+          max_obstacle_height: 0.2
+          clearing: false
+          marking: true
+          data_type: "PointCloud2"
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true

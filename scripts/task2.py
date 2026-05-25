@@ -39,6 +39,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import OccupancyGrid
+from nav2_msgs.msg import SpeedLimit
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy,
                         QoSProfile, QoSReliabilityPolicy,
                         qos_profile_sensor_data)
@@ -174,7 +175,7 @@ class Task2Node(RobotCommander):
             ('cell_red_start_xy',    '0.21,-4.90'),
             ('cell_red_end_xy',     '-1.65,-4.90'),
             ('cell_green_start_xy', '-4.85,-2.37'),
-            ('cell_green_end_xy',   '-4.85, 0.12'),
+            ('cell_green_end_xy',   '-5.15, 0.12'),
             # Yellow-bounded first room. Coverage waypoints get clipped to
             # this AABB so exploration never wanders past the yellow lines.
             ('first_room_x_min', -4.5),
@@ -187,6 +188,12 @@ class Task2Node(RobotCommander):
             ('reentry_x', 1.0),
             ('reentry_y', -0.5),
             ('reentry_yaw_deg', 180.0),
+            # Expected total counts of items in the world. If a worker
+            # dispatches a task before exploration has found them all,
+            # the robot drives more coverage waypoints until the count
+            # is met (see `_explore_until`).
+            ('total_barrels', 7),
+            ('total_rings',   3),
         ])
 
         # Subscriptions
@@ -224,6 +231,9 @@ class Task2Node(RobotCommander):
         self.dlg_prompt_pub  = self.create_publisher(String,       '/dialogue/prompt', 10)
         self.dlg_say_pub     = self.create_publisher(String,       '/dialogue/say',    10)
         self.report_path_pub = self.create_publisher(String,       '/inspection/path', _MAP_QOS)
+        # Throttles Nav2's pure-pursuit controller during the belt drive
+        # (matches speed_limit_topic configured in nav2.yaml).
+        self.speed_limit_pub = self.create_publisher(SpeedLimit,    'speed_limit',      10)
 
         self.state = State.EXPLORE_FIRST_ROOM
 
@@ -979,7 +989,53 @@ class Task2Node(RobotCommander):
     def _arm(self, pose: str) -> None:
         self.arm_cmd_pub.publish(String(data=pose))
 
+    def _explore_until(self, item_dict: dict, expected_count: int,
+                        item_label: str) -> None:
+        """Drive coverage waypoints until `len(item_dict) >= expected_count`.
+
+        Passive marker callbacks fire as the robot moves, so the dict
+        grows on its own — we just need to keep moving. If the count is
+        already met we return immediately. If we exhaust the waypoint
+        list before finding everything, we warn and return so callers
+        proceed with what they've got.
+        """
+        if len(item_dict) >= expected_count:
+            return
+        self.info(f'Searching for {item_label} — found '
+                  f'{len(item_dict)}/{expected_count}, exploring more.')
+        while (len(item_dict) < expected_count
+                and self.waypoint_idx < len(self.coverage_waypoints)
+                and rclpy.ok()):
+            wp = self.coverage_waypoints[self.waypoint_idx]
+            self.info(f'Top-up waypoint {self.waypoint_idx + 1}/'
+                      f'{len(self.coverage_waypoints)}: '
+                      f'({wp[0]:.2f}, {wp[1]:.2f})')
+            self._go_waypoint(*wp)
+            interrupted = False
+            while not self.isTaskComplete():
+                self._spin_ros()
+                if self._check_yellow_safety():
+                    interrupted = True
+                    break
+                if len(item_dict) >= expected_count:
+                    self.cancelTask()
+                    break
+            if not interrupted and not self._yellow_alert:
+                self.waypoint_idx += 1
+            self.info(f'Search progress — found '
+                      f'{len(item_dict)}/{expected_count} {item_label}.')
+        if len(item_dict) < expected_count:
+            self.warn(f'Coverage exhausted with only '
+                      f'{len(item_dict)}/{expected_count} {item_label} found; '
+                      'proceeding with what we have.')
+
     def _run_barrel_inspection(self, requestor: str) -> None:
+        # Top-up exploration: if we haven't found all the barrels yet,
+        # drive more coverage waypoints until we do (or run out).
+        total_barrels = int(
+            self.get_parameter('total_barrels').get_parameter_value().integer_value)
+        self._explore_until(self.barrels, total_barrels, 'barrels')
+
         if not self.barrels:
             self._say('I have not detected any barrels.')
             self.report.add_execution(requestor, 'barrels', [])
@@ -1027,6 +1083,12 @@ class Task2Node(RobotCommander):
         self._say(f'I inspected {len(results)} barrels.')
 
     def _run_ring_counting(self, requestor: str) -> None:
+        # Top-up exploration: if we haven't found all the rings yet,
+        # drive more coverage waypoints until we do (or run out).
+        total_rings = int(
+            self.get_parameter('total_rings').get_parameter_value().integer_value)
+        self._explore_until(self.rings, total_rings, 'rings')
+
         per_colour: dict[str, int] = {}
         for r in self.rings.values():
             cr, cg, cb = r.get('color_rgb', (0.5, 0.5, 0.5))
@@ -1085,6 +1147,49 @@ class Task2Node(RobotCommander):
             except ValueError:
                 self.warn(f'Bad cell_{colour}_xy parameter: {param!r}')
         return None
+
+    def _recover_from_stuck(self, backup_dist: float = 0.30,
+                              backup_vel: float = -0.08) -> None:
+        """Back up `backup_dist` m at `backup_vel` to clear the chassis
+        from whatever Nav2 was stuck on, so a subsequent goToPose can
+        plan a fresh path. Lightweight reuse of the safety-backup
+        cmd_vel publishing pattern; no Nav2 action involved.
+        """
+        self.warn(f'Recovery: backing up {backup_dist:.2f} m at '
+                  f'{backup_vel:.2f} m/s.')
+        duration = abs(backup_dist / backup_vel)
+        deadline = time.monotonic() + duration
+        twist = TwistStamped()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = backup_vel
+        while time.monotonic() < deadline and rclpy.ok():
+            twist.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_vel_pub.publish(twist)
+            self._spin_ros(0.05)
+        twist.twist.linear.x = 0.0
+        twist.header.stamp = self.get_clock().now().to_msg()
+        self.cmd_vel_pub.publish(twist)
+        # Brief settle so AMCL updates the pose estimate.
+        settle_deadline = time.monotonic() + 0.4
+        while time.monotonic() < settle_deadline and rclpy.ok():
+            self._spin_ros(0.05)
+        self.info('Recovery: backup complete.')
+
+    def _set_speed_limit(self, max_mps: float) -> None:
+        """Throttle Nav2's pure-pursuit controller via /speed_limit.
+
+        max_mps == 0 means "no limit" (controller uses its config default).
+        Otherwise the controller caps linear velocity at max_mps.
+        """
+        msg = SpeedLimit()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.percentage = False
+        msg.speed_limit = float(max_mps)
+        self.speed_limit_pub.publish(msg)
+        if max_mps > 0:
+            self.info(f'Nav2 speed limit set to {max_mps:.2f} m/s.')
+        else:
+            self.info('Nav2 speed limit cleared.')
 
     def _run_anomaly_inspection(self, cell_colour: str, requestor: str) -> None:
         # Read hardcoded start/end points (map frame).
@@ -1148,15 +1253,58 @@ class Task2Node(RobotCommander):
         self._arm('look_at_belt_left')
         time.sleep(9.0)
 
-        # 4) DRIVE TO END POINT via cmd_vel — straight line guaranteed.
-        #    Nav2 would curve to dodge nearby obstacles even when the
-        #    direct path is clear. The tight goal tolerance in step 1
-        #    plus the explicit spin in step 2 ensure we start exactly
-        #    on the stripe facing the right way, so open-loop forward
-        #    drive stays on the line. anomaly_detector keeps populating
-        #    self.tiles in the background while we travel.
-        self._drive_distance(stripe_len, velocity=BELT_SWEEP_VEL,
-                              cell_colour=cell_colour)
+        # 4) DRIVE TO END POINT via SEQUENCED Nav2 sub-goals.
+        #    Split the start→end line into short Nav2 hops (every ~0.5 m),
+        #    each carrying the same drive_yaw orientation. Nav2's
+        #    RegulatedPurePursuitController + tight xy_goal_tolerance
+        #    (0.05 m, set in nav2.yaml) drives between hops with
+        #    closed-loop precision, so every sub-goal pulls the robot
+        #    back onto the line — drift can't accumulate over the full
+        #    stripe. anomaly_detector keeps populating self.tiles while
+        #    we travel.
+        SUB_GOAL_STEP = 0.5
+        BELT_SPEED_LIMIT = 0.06   # m/s — slow so anomaly_detector locks tiles
+        n_steps = max(2, int(math.ceil(stripe_len / SUB_GOAL_STEP)))
+        ux = (ex - sx) / stripe_len
+        uy = (ey - sy) / stripe_len
+        self.info(f'Splitting {cell_colour} stripe into {n_steps} sub-goals '
+                  f'(~{stripe_len / n_steps:.2f} m each, capped at '
+                  f'{BELT_SPEED_LIMIT:.2f} m/s).')
+        self._set_speed_limit(BELT_SPEED_LIMIT)
+        consecutive_fails = 0
+        MAX_CONSECUTIVE_FAILS = 2
+        try:
+            for i in range(1, n_steps + 1):
+                seg_len = stripe_len * i / n_steps
+                sub_x = sx + seg_len * ux
+                sub_y = sy + seg_len * uy
+                sub_pose = PoseStamped()
+                sub_pose.header.frame_id = 'map'
+                sub_pose.header.stamp = self.get_clock().now().to_msg()
+                sub_pose.pose.position.x = sub_x
+                sub_pose.pose.position.y = sub_y
+                sub_pose.pose.orientation = self.YawToQuaternion(drive_yaw)
+                self.info(f'Belt sub-goal {i}/{n_steps} at '
+                          f'({sub_x:.2f}, {sub_y:.2f}).')
+                self.goToPose(sub_pose)
+                if not self._wait_nav_with_safety():
+                    consecutive_fails += 1
+                    self.warn(f'Belt sub-goal {i}/{n_steps} did not '
+                              f'succeed (consecutive fails: '
+                              f'{consecutive_fails}/{MAX_CONSECUTIVE_FAILS}).')
+                    if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                        self.warn('Too many sub-goals failed in a row; '
+                                  'abandoning belt drive.')
+                        break
+                    # Back up, then let Nav2 re-plan to the NEXT sub-goal
+                    # (skipping the failed one — typically the obstacle
+                    # blocked one specific spot, not the whole stripe).
+                    self._recover_from_stuck()
+                    continue
+                consecutive_fails = 0
+        finally:
+            # Always clear the speed cap, even on failure / exception.
+            self._set_speed_limit(0.0)
 
         # Hold the arm in place for 3 s so anomaly_detector gets a few
         # extra frames of the final tile (otherwise the last tile can be

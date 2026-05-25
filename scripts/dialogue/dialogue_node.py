@@ -73,7 +73,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(__file__))
 from intent_matcher import (  # noqa: E402
-    ALL_INTENTS, classify, classify_qr,
+    ALL_INTENTS, INTENT_NOTHING, classify, classify_qr,
 )
 
 
@@ -278,6 +278,22 @@ class DialogueNode(Node):
         first = self._listen_classify()
         if first is None or first.intent is None:
             return self._qr_fallback()
+
+        # If voice classified as 'nothing' (often a mishearing of ambient
+        # noise / TTS bleed-through), double-check the QR card before
+        # accepting. The QR is the authoritative source — if it carries
+        # a real task, use that instead of the voice's "nothing".
+        if first.intent == INTENT_NOTHING:
+            self.get_logger().info(
+                f'Voice classified as "nothing" (raw={first.raw!r}); '
+                'cross-checking with QR before accepting.')
+            qr_intent, qr_raw, qr_source = self._qr_fallback()
+            if qr_intent is not None and qr_intent != INTENT_NOTHING:
+                self.get_logger().info(
+                    f'QR overrides voice: {qr_intent!r} wins over "nothing".')
+                return qr_intent, qr_raw, qr_source
+            # QR also said nothing or was unreadable → trust the voice.
+            return first.intent, first.raw, 'voice'
 
         if gender == 'male':
             return first.intent, first.raw, 'voice'
