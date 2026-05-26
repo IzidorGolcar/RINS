@@ -628,15 +628,26 @@ class Task2Node(RobotCommander):
         dx, dy = rx - fx, ry - fy
         base_angle = math.atan2(dy, dx) if math.hypot(dx, dy) >= 1e-3 else 0.0
 
+        # Sweep both angle and stand-off distance. The static-map clearance
+        # has to exceed Nav2's inflation_radius (0.40 m in config/nav2.yaml)
+        # plus a small margin, or the global planner will reject the goal as
+        # in-lethal and NavigateToPose returns FAILED within ~30 ms. If no
+        # angle at the requested distance has enough clearance, push further
+        # away from the face until we find one (or exhaust the search).
+        MIN_CLEARANCE = 0.50
         best_ax, best_ay, best_clear = None, None, -1.0
-        for i in range(12):
-            angle = base_angle + i * (math.pi / 6)
-            ax = fx + math.cos(angle) * distance
-            ay = fy + math.sin(angle) * distance
-            c = self._clearance_at(ax, ay)
-            if c > best_clear:
-                best_clear = c
-                best_ax, best_ay = ax, ay
+        for d_inc in (0.0, 0.15, 0.30, 0.45):
+            d = distance + d_inc
+            for i in range(12):
+                angle = base_angle + i * (math.pi / 6)
+                ax = fx + math.cos(angle) * d
+                ay = fy + math.sin(angle) * d
+                c = self._clearance_at(ax, ay)
+                if c > best_clear:
+                    best_clear = c
+                    best_ax, best_ay = ax, ay
+            if best_clear >= MIN_CLEARANCE:
+                break
 
         ax, ay = best_ax, best_ay
         yaw = math.atan2(fy - ay, fx - ax)
@@ -1426,8 +1437,6 @@ class Task2Node(RobotCommander):
                       f'(~{stripe_len / n_steps:.2f} m each, capped at '
                       f'{BELT_SPEED_LIMIT:.2f} m/s).')
             self._set_speed_limit(BELT_SPEED_LIMIT)
-            consecutive_fails = 0
-            MAX_CONSECUTIVE_FAILS = 2
             try:
                 for i in range(1, n_steps + 1):
                     seg_len = stripe_len * i / n_steps
@@ -1444,20 +1453,15 @@ class Task2Node(RobotCommander):
                     self.goToPose(sub_pose)
                     if not self._wait_belt_subgoal(stuck_timeout_s=8.0,
                                                     stuck_distance=0.04):
-                        consecutive_fails += 1
+                        # Skip to the next sub-goal instead of aborting the
+                        # stripe — anomaly_detector keeps locking tiles for
+                        # whatever distance the robot covered, and the planner
+                        # gets a chance to route around whatever blocked this
+                        # one specific spot. No backup: that just undoes the
+                        # progress we did make.
                         self.warn(f'Belt sub-goal {i}/{n_steps} did not '
-                                  f'succeed (consecutive fails: '
-                                  f'{consecutive_fails}/{MAX_CONSECUTIVE_FAILS}).')
-                        if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
-                            self.warn('Too many sub-goals failed in a row; '
-                                      'abandoning belt drive.')
-                            break
-                        # Back up, then let Nav2 re-plan to the NEXT sub-goal
-                        # (skipping the failed one — typically the obstacle
-                        # blocked one specific spot, not the whole stripe).
-                        self._recover_from_stuck()
+                                  f'succeed — skipping to next.')
                         continue
-                    consecutive_fails = 0
             finally:
                 # Always clear the speed cap, even on failure / exception.
                 self._set_speed_limit(0.0)

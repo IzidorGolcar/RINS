@@ -377,11 +377,12 @@ class DialogueNode(Node):
     # --------------------------------------------------------- QR fallback
 
     def _qr_fallback(self) -> tuple[Optional[str], str, str]:
-        """QR fallback via the forward OAK-D only.
+        """Try the forward OAK-D first; on failure, aim the arm-mounted
+        top camera at the QR card and try again.
 
-        The OAK-D is already pointed at the worker after task2's approach
-        spin, so the QR card "next to the person" should be in frame. No
-        arm motion needed — saves the ~8 s arm settle + scan + park cycle.
+        The OAK-D preview is small (~250 px) and can miss a QR held off-axis
+        or too far away. The top camera is mounted on the arm wrist, so by
+        moving the arm to `look_for_qr` we can frame the card much tighter.
         """
         if not _ZBAR_OK:
             return None, '', 'timeout'
@@ -390,13 +391,29 @@ class DialogueNode(Node):
         self._tts('Let me check the code.')
 
         intent, payload = self._scan_camera('oakd', window_s=QR_FRAME_WAIT_S)
-        if intent is None:
-            self.get_logger().warn(
-                f'QR fallback: no recognised code on OAK-D '
-                f'(last raw payload seen: {payload!r}).')
-            return None, payload, 'timeout'
-        self.get_logger().info(f'QR via OAK-D: {payload!r} → {intent}')
-        return intent, payload, 'qr'
+        if intent is not None:
+            self.get_logger().info(f'QR via OAK-D: {payload!r} → {intent}')
+            return intent, payload, 'qr'
+
+        self.get_logger().info(
+            f'QR fallback: nothing via OAK-D (last raw: {payload!r}); '
+            'aiming arm-mounted top camera.')
+        self.arm_cmd_pub.publish(String(data='look_for_qr'))
+        time.sleep(QR_ARM_SETTLE_S)
+        try:
+            intent_top, payload_top = self._scan_camera('top', window_s=QR_FRAME_WAIT_S)
+        finally:
+            self.arm_cmd_pub.publish(String(data='garage'))
+
+        if intent_top is not None:
+            self.get_logger().info(
+                f'QR via top camera: {payload_top!r} → {intent_top}')
+            return intent_top, payload_top, 'qr'
+
+        self.get_logger().warn(
+            f'QR fallback: no recognised code on either camera '
+            f'(last raw payloads: oakd={payload!r}, top={payload_top!r}).')
+        return None, payload_top or payload, 'timeout'
 
     def _scan_camera(self, cam: str, window_s: float) -> tuple[Optional[str], str]:
         """Poll one camera's latest frame for a known QR payload.
