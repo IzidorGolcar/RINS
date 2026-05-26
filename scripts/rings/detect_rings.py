@@ -18,7 +18,7 @@ import message_filters
 from geometry_msgs.msg import PointStamped
 from rclpy.time import Time
 import tf2_geometry_msgs
-from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import CameraInfo, Image
 from ring_map import *
 
 qos_profile = QoSProfile(
@@ -28,6 +28,9 @@ qos_profile = QoSProfile(
           depth=1)
 
 class RingDetector(Node):
+    BLACK_MAX_V = 95
+    BLACK_MAX_S = 80
+
     def __init__(self):
         super().__init__('transform_point')
 
@@ -52,6 +55,13 @@ class RingDetector(Node):
         self.received_camera_info = False
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
+        self.ground_mask_image = None
+        self.ground_mask_sub = self.create_subscription(
+            Image,
+            '/line_detector/ground_mask',
+            self.ground_mask_callback,
+            qos_profile
+        )
         self.cam_info_sub = self.create_subscription(
             CameraInfo,
             '/oakd/rgb/preview/camera_info',
@@ -62,6 +72,15 @@ class RingDetector(Node):
         self.ring_map = RingMap()
 
         cv2.namedWindow('Ring Detections', cv2.WINDOW_NORMAL)
+
+    def ground_mask_callback(self, msg):
+        try:
+            mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+            self.ground_mask_image = (mask > 0).astype(np.uint8)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to read ground mask: {e}')
 
     def cam_info_callback(self, msg):
         if self.fx is None:
@@ -96,44 +115,21 @@ class RingDetector(Node):
         absolute_height = H_cam - h_rel
         return absolute_height
     
-    def get_roi(self, img_rgb, img_depth, max_depth=3.5):
+    def get_roi(self, img_rgb, img_depth, ground_mask=None, max_depth=3.5):
         h, w = img_rgb.shape[:2]
         dist_mask = (img_depth > 0.1) & (img_depth <= max_depth)
-        ground_cutoff = int(h * 0.6)
-        no_ground_mask = np.ones((h, w), dtype=bool)
-        no_ground_mask[ground_cutoff:, :] = False
+        if ground_mask is not None and ground_mask.shape[:2] == (h, w):
+            no_ground_mask = ground_mask <= 0
+        else:
+            print('no ground mask')
+            ground_cutoff = int(h * 0.6)
+            no_ground_mask = np.ones((h, w), dtype=bool)
+            no_ground_mask[ground_cutoff:, :] = False
         roi_mask = dist_mask & no_ground_mask
         foreground_rgb = np.zeros_like(img_rgb)
         foreground_rgb[roi_mask] = img_rgb[roi_mask]
         roi_pixels = foreground_rgb[roi_mask].reshape((-1, 3)).astype(np.float32)
         return roi_pixels, roi_mask
-
-    def cluster_colors(self, roi_pixels, roi_mask, K=6):
-        (h, w) = roi_mask.shape
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-        _, labels, _ = cv2.kmeans(roi_pixels, K, None, criteria, 8, cv2.KMEANS_RANDOM_CENTERS)
-        labels_reshape = np.zeros((h, w), dtype=np.int32) - 1
-        labels_reshape[roi_mask] = labels.flatten()
-        return labels_reshape
-
-    def build_label_map(self, labels):
-        (h, w) = labels.shape
-        label_map = np.zeros((h, w), dtype=np.uint8)
-        current_id = 1
-
-        K = len(np.unique(labels))
-
-        for cluster_id in range(K):
-            cluster_mask = (labels == cluster_id).astype(np.uint8) * 255
-            num_labels, cc_labels = cv2.connectedComponents(cluster_mask)
-            for i in range(1, num_labels):
-                object_mask = (cc_labels == i)
-                area = np.sum(object_mask)
-                if 50 < area < (h * w * 0.1):
-                    label_map[object_mask] = (current_id * 40) % 255
-                    current_id += 1
-        return label_map
-
 
     def get_average_color(self, image_rgb, mask):
         mask_bool = mask.astype(bool)
@@ -153,31 +149,23 @@ class RingDetector(Node):
             cv2.putText(output, label, (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, ring_color, 1)
         cv2.imshow('Ring Detections', output)
 
-    def is_grey(self, bgr: tuple[int, int, int], sat_threshold: int = 20) -> bool:
-        pixel = np.uint8([[list(bgr)]])
-        s = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0, 0, 1]
-        return int(s) <= sat_threshold
+    def _classify_allowed_color(self, bgr: tuple[int, int, int]) -> Optional[str]:
+        """Return an allowed ring colour or None for likely false positives."""
+        b, g, r = [int(c) for c in bgr]
+        px = np.uint8([[[b, g, r]]])
+        h, s, v = cv2.cvtColor(px, cv2.COLOR_BGR2HSV)[0, 0]
 
-    def _classify_ring_color(self, bgr: tuple[int, int, int]) -> Optional[str]:
-        """Map a BGR triple to one of the allowed ring colours.
-
-        Per spec, rings are only red / green / blue / black. Anything
-        else returns None and the candidate is rejected.
-        """
-        b, g, r = int(bgr[0]), int(bgr[1]), int(bgr[2])
-        # Black: all channels dark.
-        if max(b, g, r) < 60:
+        if (v <= self.BLACK_MAX_V and s <= self.BLACK_MAX_S) or (v < 55 and s < 140):
             return 'black'
-        # Red dominant.
-        if r > 100 and r > g + 30 and r > b + 30:
+
+        if s < 50:
+            return None
+
+        if h <= 12 or h >= 168:
             return 'red'
-        # Green dominant.
-        if g > 80 and g > r + 20 and g > b + 20:
+        if 40 <= h <= 90:
             return 'green'
-        # Blue dominant. Loosened from (b > 80, +20 dominance) to catch
-        # darker blues — the ring sometimes registers around B≈55–80
-        # which previously fell into "unknown".
-        if b > 45 and b > r + 12 and b > g + 12:
+        if 95 <= h <= 140:
             return 'blue'
         return None
 
@@ -187,6 +175,7 @@ class RingDetector(Node):
         results = []
         (h, w) = label_map.shape
         unique_labels = np.unique(label_map)
+        hsv_image = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2HSV)
 
         for val in unique_labels:
             if val == 0: continue
@@ -194,11 +183,16 @@ class RingDetector(Node):
 
             ring_color = self.get_average_color(img_rgb, mask)
 
-            if self.is_grey(ring_color):
-                continue
-            # Per-spec constraint: rings are only red / green / blue / black.
-            # Reject anything that doesn't classify cleanly.
-            colour_name = self._classify_ring_color(ring_color)
+            mask_bool = mask > 0
+            if np.any(mask_bool):
+                v_vals = hsv_image[:, :, 2][mask_bool]
+                s_vals = hsv_image[:, :, 1][mask_bool]
+                dark_ratio = float(np.mean(v_vals < 90))
+                sat_med = float(np.median(s_vals))
+                if dark_ratio > 0.45 and sat_med < 95:
+                    ring_color = (0, 0, 0)
+
+            colour_name = self._classify_allowed_color(ring_color)
             if colour_name is None:
                 continue
             
@@ -363,16 +357,29 @@ class RingDetector(Node):
             self.ring_pub.publish(marker_array)
 
     def detect_rings(self, img_rgb, img_depth):
-        roi_pixels, roi_mask = self.get_roi(img_rgb, img_depth)
-        clusters = self.cluster_colors(roi_pixels, roi_mask)
-        label_map = self.build_label_map(clusters)
+        _, roi_mask = self.get_roi(img_rgb, img_depth, self.ground_mask_image)
+
+        masked_rgb = np.zeros_like(img_rgb)
+        masked_rgb[roi_mask] = img_rgb[roi_mask]
+
+        from color_segmentation import ObjectDetector
+        detector = ObjectDetector()
+        label_map = detector.get_labels(
+            masked_rgb,
+            downscale_factor=1,
+            n_clusters=7,
+            sample_size=8_000,
+            min_area=100,
+            max_area=8500,
+            morph_kernel_size=3,
+            morph_iterations=1,
+        )
         rings = self.find_rings(label_map, img_rgb, img_depth)
         self.display_detections(img_rgb, rings)
 
         close_rings = [ring for ring in rings if ring['depth'] < 2]
 
         self.localize(close_rings)
-
         
 
 

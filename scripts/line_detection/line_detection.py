@@ -89,6 +89,7 @@ class LineDetector(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.pc_pub = self.create_publisher(PointCloud2, '/line_detector/points', 10)
+        self.ground_mask_pub = self.create_publisher(Image, '/line_detector/ground_mask', _LATCHED_QOS)
         self.class_pubs = {
             1: self.create_publisher(PointCloud2, '/line_detector/yellow', 10),
             2: self.create_publisher(PointCloud2, '/line_detector/red',    10),
@@ -160,6 +161,10 @@ class LineDetector(Node):
                 if m.ndim == 3:
                     m = m[:, :, 0]
                 m = (m > 0).astype(np.uint8)
+
+                mask_msg = self.bridge.cv2_to_imgmsg((m * 255).astype(np.uint8), encoding='mono8')
+                mask_msg.header = rgb_msg.header
+                self.ground_mask_pub.publish(mask_msg)
 
                 line_labels = line_mask(depth_for_processing, rgb_display, mask)
                 if line_labels is not None and line_labels.max() > 0:
