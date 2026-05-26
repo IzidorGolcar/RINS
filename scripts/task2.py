@@ -245,6 +245,7 @@ class Task2Node(RobotCommander):
         # Direct cmd_vel for the safety backup + belt sweep (Nav2 owns /cmd_vel_nav).
         self.cmd_vel_pub     = self.create_publisher(TwistStamped, '/cmd_vel_nav',     10)
         self.arm_cmd_pub     = self.create_publisher(String,       '/arm_command',     10)
+        self.anomaly_enable_pub = self.create_publisher(Bool,      '/anomaly_detector/enabled', 10)
         self.dlg_prompt_pub  = self.create_publisher(String,       '/dialogue/prompt', 10)
         self.dlg_say_pub     = self.create_publisher(String,       '/dialogue/say',    10)
         self.report_path_pub = self.create_publisher(String,       '/inspection/path', _MAP_QOS)
@@ -1336,6 +1337,13 @@ class Task2Node(RobotCommander):
         else:
             self.info('Nav2 speed limit cleared.')
 
+    def _set_anomaly_detector_enabled(self, enabled: bool) -> None:
+        """Enable/disable anomaly_detector processing."""
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.anomaly_enable_pub.publish(msg)
+        self.info(f'Anomaly detector {"enabled" if enabled else "disabled"}.')
+
     def _run_anomaly_inspection(self, cell_colour: str, requestor: str) -> None:
         # Read hardcoded start/end points (map frame).
         start_xy = self._parse_xy_param(f'cell_{cell_colour}_start_xy')
@@ -1388,79 +1396,82 @@ class Task2Node(RobotCommander):
         # Clear tiles from any previous run so we report only this cell.
         self.tiles.clear()
 
-        # 3) EXTEND ARM toward the tiles. arm_mover_actions has a 1 Hz
-        #    timer + 3 s trajectory `time_from_start`, so each pose
-        #    change can take ~4 s end-to-end. Wait 4 s after `up` and
-        #    5 s after `look_at_belt_left` so the arm is FULLY in the
-        #    scanning position before the robot starts moving.
-        self._arm('up')
-        time.sleep(5.0)
-        self._arm('look_at_belt_left')
-        time.sleep(12.0)
-
-        # 4) DRIVE TO END POINT via SEQUENCED Nav2 sub-goals.
-        #    Split the start→end line into short Nav2 hops (every ~0.5 m),
-        #    each carrying the same drive_yaw orientation. Nav2's
-        #    RegulatedPurePursuitController + tight xy_goal_tolerance
-        #    (0.05 m, set in nav2.yaml) drives between hops with
-        #    closed-loop precision, so every sub-goal pulls the robot
-        #    back onto the line — drift can't accumulate over the full
-        #    stripe. anomaly_detector keeps populating self.tiles while
-        #    we travel.
-        SUB_GOAL_STEP = 0.5
-        BELT_SPEED_LIMIT = 0.06   # m/s — slow so anomaly_detector locks tiles
-        n_steps = max(2, int(math.ceil(stripe_len / SUB_GOAL_STEP)))
-        ux = (ex - sx) / stripe_len
-        uy = (ey - sy) / stripe_len
-        self.info(f'Splitting {cell_colour} stripe into {n_steps} sub-goals '
-                  f'(~{stripe_len / n_steps:.2f} m each, capped at '
-                  f'{BELT_SPEED_LIMIT:.2f} m/s).')
-        self._set_speed_limit(BELT_SPEED_LIMIT)
-        consecutive_fails = 0
-        MAX_CONSECUTIVE_FAILS = 2
+        self._set_anomaly_detector_enabled(True)
         try:
-            for i in range(1, n_steps + 1):
-                seg_len = stripe_len * i / n_steps
-                sub_x = sx + seg_len * ux
-                sub_y = sy + seg_len * uy
-                sub_pose = PoseStamped()
-                sub_pose.header.frame_id = 'map'
-                sub_pose.header.stamp = self.get_clock().now().to_msg()
-                sub_pose.pose.position.x = sub_x
-                sub_pose.pose.position.y = sub_y
-                sub_pose.pose.orientation = self.YawToQuaternion(drive_yaw)
-                self.info(f'Belt sub-goal {i}/{n_steps} at '
-                          f'({sub_x:.2f}, {sub_y:.2f}).')
-                self.goToPose(sub_pose)
-                if not self._wait_belt_subgoal(stuck_timeout_s=8.0,
-                                                stuck_distance=0.04):
-                    consecutive_fails += 1
-                    self.warn(f'Belt sub-goal {i}/{n_steps} did not '
-                              f'succeed (consecutive fails: '
-                              f'{consecutive_fails}/{MAX_CONSECUTIVE_FAILS}).')
-                    if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
-                        self.warn('Too many sub-goals failed in a row; '
-                                  'abandoning belt drive.')
-                        break
-                    # Back up, then let Nav2 re-plan to the NEXT sub-goal
-                    # (skipping the failed one — typically the obstacle
-                    # blocked one specific spot, not the whole stripe).
-                    self._recover_from_stuck()
-                    continue
-                consecutive_fails = 0
+            # 3) EXTEND ARM toward the tiles. arm_mover_actions has a 1 Hz
+            #    timer + 3 s trajectory `time_from_start`, so each pose
+            #    change can take ~4 s end-to-end. Wait 4 s after `up` and
+            #    5 s after `look_at_belt_left` so the arm is FULLY in the
+            #    scanning position before the robot starts moving.
+            self._arm('up')
+            time.sleep(5.0)
+            self._arm('look_at_belt_left')
+            time.sleep(12.0)
+
+            # 4) DRIVE TO END POINT via SEQUENCED Nav2 sub-goals.
+            #    Split the start→end line into short Nav2 hops (every ~0.5 m),
+            #    each carrying the same drive_yaw orientation. Nav2's
+            #    RegulatedPurePursuitController + tight xy_goal_tolerance
+            #    (0.05 m, set in nav2.yaml) drives between hops with
+            #    closed-loop precision, so every sub-goal pulls the robot
+            #    back onto the line — drift can't accumulate over the full
+            #    stripe. anomaly_detector keeps populating self.tiles while
+            #    we travel.
+            SUB_GOAL_STEP = 0.5
+            BELT_SPEED_LIMIT = 0.06   # m/s — slow so anomaly_detector locks tiles
+            n_steps = max(2, int(math.ceil(stripe_len / SUB_GOAL_STEP)))
+            ux = (ex - sx) / stripe_len
+            uy = (ey - sy) / stripe_len
+            self.info(f'Splitting {cell_colour} stripe into {n_steps} sub-goals '
+                      f'(~{stripe_len / n_steps:.2f} m each, capped at '
+                      f'{BELT_SPEED_LIMIT:.2f} m/s).')
+            self._set_speed_limit(BELT_SPEED_LIMIT)
+            consecutive_fails = 0
+            MAX_CONSECUTIVE_FAILS = 2
+            try:
+                for i in range(1, n_steps + 1):
+                    seg_len = stripe_len * i / n_steps
+                    sub_x = sx + seg_len * ux
+                    sub_y = sy + seg_len * uy
+                    sub_pose = PoseStamped()
+                    sub_pose.header.frame_id = 'map'
+                    sub_pose.header.stamp = self.get_clock().now().to_msg()
+                    sub_pose.pose.position.x = sub_x
+                    sub_pose.pose.position.y = sub_y
+                    sub_pose.pose.orientation = self.YawToQuaternion(drive_yaw)
+                    self.info(f'Belt sub-goal {i}/{n_steps} at '
+                              f'({sub_x:.2f}, {sub_y:.2f}).')
+                    self.goToPose(sub_pose)
+                    if not self._wait_belt_subgoal(stuck_timeout_s=8.0,
+                                                    stuck_distance=0.04):
+                        consecutive_fails += 1
+                        self.warn(f'Belt sub-goal {i}/{n_steps} did not '
+                                  f'succeed (consecutive fails: '
+                                  f'{consecutive_fails}/{MAX_CONSECUTIVE_FAILS}).')
+                        if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                            self.warn('Too many sub-goals failed in a row; '
+                                      'abandoning belt drive.')
+                            break
+                        # Back up, then let Nav2 re-plan to the NEXT sub-goal
+                        # (skipping the failed one — typically the obstacle
+                        # blocked one specific spot, not the whole stripe).
+                        self._recover_from_stuck()
+                        continue
+                    consecutive_fails = 0
+            finally:
+                # Always clear the speed cap, even on failure / exception.
+                self._set_speed_limit(0.0)
+
+            # Hold the arm in place for 3 s so anomaly_detector gets a few
+            # extra frames of the final tile (otherwise the last tile can be
+            # missed because the robot moved past it just as it locked).
+            self.info('Stripe end reached; holding 3 s for last-tile lock.')
+            end_settle = time.monotonic() + 3.0
+            while time.monotonic() < end_settle and rclpy.ok():
+                self._spin_ros(0.1)
         finally:
-            # Always clear the speed cap, even on failure / exception.
-            self._set_speed_limit(0.0)
-
-        # Hold the arm in place for 3 s so anomaly_detector gets a few
-        # extra frames of the final tile (otherwise the last tile can be
-        # missed because the robot moved past it just as it locked).
-        self.info('Stripe end reached; holding 3 s for last-tile lock.')
-        end_settle = time.monotonic() + 3.0
-        while time.monotonic() < end_settle and rclpy.ok():
-            self._spin_ros(0.1)
-
-        self._arm('garage')
+            self._set_anomaly_detector_enabled(False)
+            self._arm('garage')
 
         # Snapshot into the report.
         results = [

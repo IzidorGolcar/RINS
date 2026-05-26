@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 
 from sensor_msgs.msg import CameraInfo, Image, JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool
 from cv_bridge import CvBridgeError, CvBridge
 from geometry_msgs.msg import PointStamped
 from rclpy.qos import qos_profile_sensor_data
@@ -55,8 +55,6 @@ class AnomalyDetector(Node):
         self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, qos_profile_sensor_data)
         self.detection_enabled_sub = self.create_subscription(Bool, "/anomaly_detector/enabled", self.detection_enabled_callback, 10)
         self.detection_enabled = False
-        
-        self.arm_command_pub = self.create_publisher(String, "/arm_command", 10)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -171,14 +169,8 @@ class AnomalyDetector(Node):
         self.detection_enabled = msg.data
         if self.detection_enabled:
             self.get_logger().info("Anomaly detection enabled")
-            arm_cmd = String()
-            arm_cmd.data = "look_at_belt_left"
-            self.arm_command_pub.publish(arm_cmd)
         else:
             self.get_logger().info("Anomaly detection disabled")
-            arm_cmd = String()
-            arm_cmd.data = "garage"
-            self.arm_command_pub.publish(arm_cmd)
 
     def _display_detection_disabled(self):
         """Display a black window with white text saying detection is disabled."""

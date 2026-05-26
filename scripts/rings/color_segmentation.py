@@ -4,19 +4,6 @@ import numpy as np
 
 class ObjectDetector:
 
-    def display_label_map(self, label_map):
-        label_u8 = np.zeros_like(label_map, dtype=np.uint8)
-        unique_labels = np.unique(label_map)
-        positive_labels = [label for label in unique_labels if label > 0]
-
-        if positive_labels:
-            for index, label in enumerate(positive_labels):
-                color_value = int(index * 255 / max(len(positive_labels) - 1, 1))
-                label_u8[label_map == label] = color_value
-
-        colored = cv2.applyColorMap(label_u8, cv2.COLORMAP_TURBO)
-        colored[label_map <= 0] = 0
-        cv2.imshow('Color Segmentation Label Map', colored)
 
     def _cluster(self, img, n_clusters=9, sample_size=10_000):
         h, w = img.shape[:2]
@@ -133,5 +120,4 @@ class ObjectDetector:
             (w, h),
             interpolation=cv2.INTER_NEAREST,
         )
-        self.display_label_map(full_size)
         return full_size
