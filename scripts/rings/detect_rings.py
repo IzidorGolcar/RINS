@@ -41,7 +41,7 @@ class RingDetector(Node):
 
         self.stream = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
-            queue_size=1,
+            queue_size=10,
             slop=0.1
         )
 
@@ -56,16 +56,17 @@ class RingDetector(Node):
         self.fx = self.fy = None
         self.cx_principal = self.cy_principal = None
         self.ground_mask_image = None
-        self.ground_mask_sub = self.create_subscription(
-            Image,
-            '/line_detector/ground_mask',
-            self.ground_mask_callback,
-            qos_profile
-        )
+        self.ground_mask_stamp_ns = None
         self.cam_info_sub = self.create_subscription(
             CameraInfo,
             '/oakd/rgb/preview/camera_info',
             self.cam_info_callback,
+            qos_profile
+        )
+        self.ground_mask_sub = self.create_subscription(
+            Image,
+            '/line_detector/ground_mask',
+            self.ground_mask_callback,
             qos_profile
         )
 
@@ -73,12 +74,16 @@ class RingDetector(Node):
 
         cv2.namedWindow('Ring Detections', cv2.WINDOW_NORMAL)
 
+    def _stamp_to_ns(self, stamp):
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
     def ground_mask_callback(self, msg):
         try:
-            mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+            mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
             if mask.ndim == 3:
                 mask = mask[:, :, 0]
             self.ground_mask_image = (mask > 0).astype(np.uint8)
+            self.ground_mask_stamp_ns = self._stamp_to_ns(msg.header.stamp)
         except Exception as e:
             self.get_logger().warn(f'Failed to read ground mask: {e}')
 
@@ -101,8 +106,16 @@ class RingDetector(Node):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(rgb_data, 'bgr8')
             depth_image = self.bridge.imgmsg_to_cv2(depth_data, '32FC1')
+            rgb_stamp_ns = self._stamp_to_ns(rgb_data.header.stamp)
+            depth_stamp_ns = self._stamp_to_ns(depth_data.header.stamp)
+            frame_stamp_ns = max(rgb_stamp_ns, depth_stamp_ns)
 
-            self.detect_rings(cv_image.copy(), depth_image.copy())
+            ground_mask = None
+            if self.ground_mask_image is not None and self.ground_mask_stamp_ns is not None:
+                if abs(self.ground_mask_stamp_ns - frame_stamp_ns) <= 200_000_000:
+                    ground_mask = self.ground_mask_image
+
+            self.detect_rings(cv_image.copy(), depth_image.copy(), ground_mask)
 
             cv2.waitKey(1)
         except Exception as e:
@@ -119,9 +132,14 @@ class RingDetector(Node):
         h, w = img_rgb.shape[:2]
         dist_mask = (img_depth > 0.1) & (img_depth <= max_depth)
         if ground_mask is not None and ground_mask.shape[:2] == (h, w):
-            no_ground_mask = ground_mask <= 0
+            ground_mask_u8 = (ground_mask > 0).astype(np.uint8)
+            ground_mask_u8 = cv2.dilate(
+                ground_mask_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=1,
+            )
+            no_ground_mask = ground_mask_u8 <= 0
         else:
-            print('no ground mask')
             ground_cutoff = int(h * 0.6)
             no_ground_mask = np.ones((h, w), dtype=bool)
             no_ground_mask[ground_cutoff:, :] = False
@@ -356,8 +374,8 @@ class RingDetector(Node):
         if len(marker_array.markers) > 0:
             self.ring_pub.publish(marker_array)
 
-    def detect_rings(self, img_rgb, img_depth):
-        _, roi_mask = self.get_roi(img_rgb, img_depth, self.ground_mask_image)
+    def detect_rings(self, img_rgb, img_depth, ground_mask):
+        _, roi_mask = self.get_roi(img_rgb, img_depth, ground_mask)
 
         masked_rgb = np.zeros_like(img_rgb)
         masked_rgb[roi_mask] = img_rgb[roi_mask]
@@ -370,7 +388,7 @@ class RingDetector(Node):
             n_clusters=7,
             sample_size=8_000,
             min_area=100,
-            max_area=8500,
+            max_area=500,
             morph_kernel_size=3,
             morph_iterations=1,
         )

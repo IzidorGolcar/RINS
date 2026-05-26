@@ -163,7 +163,7 @@ class LineDetector(Node):
                 m = (m > 0).astype(np.uint8)
 
                 mask_msg = self.bridge.cv2_to_imgmsg((m * 255).astype(np.uint8), encoding='mono8')
-                mask_msg.header = rgb_msg.header
+                mask_msg.header = depth_msg.header
                 self.ground_mask_pub.publish(mask_msg)
 
                 line_labels = line_mask(depth_for_processing, rgb_display, mask)
