@@ -173,7 +173,7 @@ def ground_mask(
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
         small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.erode(mask, small_kernel, iterations=2)
+        mask = cv2.erode(mask, small_kernel, iterations=3)
     except Exception:
         pass
 
