@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from sensor_msgs.msg import CameraInfo, Image, JointState
+from std_msgs.msg import Bool, String
 from cv_bridge import CvBridgeError, CvBridge
 from geometry_msgs.msg import PointStamped
 from rclpy.qos import qos_profile_sensor_data
@@ -52,6 +53,10 @@ class AnomalyDetector(Node):
         self.depth_sub = self.create_subscription(Image, "/top_camera/rgb/preview/depth", self.depth_callback, qos_profile_sensor_data)
         self.camera_info_sub = self.create_subscription(CameraInfo, "/top_camera/rgb/preview/camera_info", self.camera_info_callback, qos_profile_sensor_data)
         self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, qos_profile_sensor_data)
+        self.detection_enabled_sub = self.create_subscription(Bool, "/anomaly_detector/enabled", self.detection_enabled_callback, 10)
+        self.detection_enabled = False
+        
+        self.arm_command_pub = self.create_publisher(String, "/arm_command", 10)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -162,7 +167,39 @@ class AnomalyDetector(Node):
 
         self._arm_is_moving = self._arm_stable_samples < 10
 
+    def detection_enabled_callback(self, msg):
+        self.detection_enabled = msg.data
+        if self.detection_enabled:
+            self.get_logger().info("Anomaly detection enabled")
+            arm_cmd = String()
+            arm_cmd.data = "look_at_belt_left"
+            self.arm_command_pub.publish(arm_cmd)
+        else:
+            self.get_logger().info("Anomaly detection disabled")
+            arm_cmd = String()
+            arm_cmd.data = "garage"
+            self.arm_command_pub.publish(arm_cmd)
+
+    def _display_detection_disabled(self):
+        """Display a black window with white text saying detection is disabled."""
+        disabled_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        text = "Detection Disabled"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.5
+        thickness = 3
+        text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+        text_x = (disabled_img.shape[1] - text_size[0]) // 2
+        text_y = (disabled_img.shape[0] + text_size[1]) // 2
+        cv2.putText(disabled_img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+        cv2.imshow('Tile Detections', disabled_img)
+        cv2.imshow('Tiles', disabled_img)
+
     def camera_frame_callback(self, msg):
+        if not self.detection_enabled:
+            self._display_detection_disabled()
+            cv2.waitKey(1)
+            return
+
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             self.detect_anomalies(cv_image)
