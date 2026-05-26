@@ -114,7 +114,8 @@ class BlueLineFollower(Node):
 
     def control_loop(self):
         if self.state == 'waiting':
-            self._publish_vel(0.0, 0.0)
+            # Do not publish zero velocities while waiting — avoids overriding
+            # teleop or Nav2 commands on /cmd_vel before the follower is started.
             return
         
         elif self.state == 'navigating_to_start':
