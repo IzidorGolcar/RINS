@@ -31,37 +31,48 @@ controller_server:
     use_realtime_priority: false
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.12
+      # Drop to 5 s so the BT recovery (clear costmap → backup → spin) fires
+      # quickly when the robot is wedged against an obstacle.
+      movement_time_allowance: 5.0
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.07
-      yaw_goal_tolerance: 0.05
+      # Tight tolerance is critical for the anomaly inspection: the
+      # robot must land EXACTLY on the stripe's start coordinate so the
+      # subsequent open-loop cmd_vel drive along the line doesn't sit
+      # offset toward the belt and clip it.
+      xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.15
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.5
-      lookahead_dist: 0.6
-      min_lookahead_dist: 0.3
-      max_lookahead_dist: 0.9
+      # Throttleable via /speed_limit (nav2_msgs/SpeedLimit) — task2
+      # publishes a low limit during the conveyor-belt inspection so
+      # anomaly_detector gets enough frames per tile, and clears it
+      # afterwards for full speed in the rest of the mission.
+      speed_limit_topic: "speed_limit"
+      desired_linear_vel: 0.975
+      lookahead_dist: 0.9
+      min_lookahead_dist: 0.55
+      max_lookahead_dist: 1.2
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 1.8
+      rotate_to_heading_angular_vel: 2.4
       transform_tolerance: 0.1
       use_velocity_scaled_lookahead_dist: false
-      min_approach_linear_velocity: 0.05
-      approach_velocity_scaling_dist: 0.6
-      use_collision_detection: true
-      max_allowed_time_to_collision_up_to_carrot: 1.0
+      min_approach_linear_velocity: 0.11
+      approach_velocity_scaling_dist: 0.25
+      use_collision_detection: false
+      max_allowed_time_to_collision_up_to_carrot: 0.3
       use_regulated_linear_velocity_scaling: true
       use_fixed_curvature_lookahead: false
       curvature_lookahead_dist: 0.25
       use_cost_regulated_linear_velocity_scaling: false
       regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.25
+      regulated_linear_scaling_min_speed: 0.10
       use_rotate_to_heading: true
       allow_reversing: false
-      rotate_to_heading_min_angle: 0.785
-      max_angular_accel: 3.2
+      rotate_to_heading_min_angle: 0.4
+      max_angular_accel: 3.6
       max_robot_pose_search_dist: 10.0
 
 local_costmap:
@@ -88,7 +99,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+        inflation_radius: 0.25
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -99,8 +110,8 @@ local_costmap:
         max_obstacle_height: 2.0
         mark_threshold: 0
         observation_sources: scan_filtered line_obstacles
-        scan:
-          topic: scan
+        scan_filtered:
+          topic: scan_filtered
           max_obstacle_height: 2.0
           clearing: true
           marking: true
@@ -173,7 +184,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+        inflation_radius: 0.25
 
       yellow_line_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
@@ -226,6 +237,9 @@ behavior_server:
     behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
       plugin: "nav2_behaviors::Spin"
+      max_rotational_vel: 1.8
+      min_rotational_vel: 0.2
+      rotational_acc_lim: 2.0
     backup:
       plugin: "nav2_behaviors::BackUp"
     drive_on_heading:
@@ -261,10 +275,12 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.26, 0.0, 1.0]
-    min_velocity: [-0.26, 0.0, -1.0]
-    max_accel: [2.5, 0.0, 3.2]
-    max_decel: [-2.5, 0.0, -3.2]
+    max_velocity: [0.75, 0.0, 4.05]
+    # min_velocity[0] must be negative for the Nav2 `backup` recovery
+    # behavior (and task2's yellow-line reverse) to actually move the wheels.
+    min_velocity: [-0.75, 0.0, -4.5]
+    max_accel: [2.4, 0.0, 3.6]
+    max_decel: [-2.4, 0.0, -3.6]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -289,7 +305,7 @@ collision_monitor:
       type: "polygon"
       action_type: "approach"
       footprint_topic: "local_costmap/published_footprint"
-      time_before_collision: 1.2
+      time_before_collision: 0.7
       simulation_time_step: 0.1
       min_points: 6
       visualize: False
