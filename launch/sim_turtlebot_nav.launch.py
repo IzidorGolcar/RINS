@@ -27,10 +27,10 @@ pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
 ARGUMENTS = [
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
     DeclareLaunchArgument('rviz', default_value='true', choices=['true', 'false'], description='Start rviz.'),
-    DeclareLaunchArgument('world', default_value='task2_blue_demo', description='Simulation World'),
+    DeclareLaunchArgument('world', default_value='task2', description='Simulation World'),
     DeclareLaunchArgument('model', default_value='standard', choices=['standard', 'lite'], description='Turtlebot4 Model'),
     DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false'], description='use_sim_time'),
-    DeclareLaunchArgument('map', default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'maps', 'map_task2_blue.yaml']), description='Full path to map yaml file to load')
+    DeclareLaunchArgument('map', default_value=PathJoinSubstitution([pkg_dis_tutorial3, 'maps', 'factory.yaml']), description='Full path to map yaml file to load')
 ]
 
 for pose_element in ['x', 'y', 'z', 'yaw']:
